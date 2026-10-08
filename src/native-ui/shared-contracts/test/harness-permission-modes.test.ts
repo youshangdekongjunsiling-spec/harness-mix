@@ -47,6 +47,16 @@ describe("Harness Permission Mode runtime contracts", () => {
     expect(harnessConfigurationStateSchema.parse({ effectivePermissionModeId: "default" })).toEqual(
       { effectivePermissionModeId: "default" },
     );
+    expect(harnessConfigurationStateSchema.parse({
+      effectivePermissionModeId: "default",
+      selectedPermissionModeId: "bypassPermissions",
+      permissionModePending: true,
+    })).toEqual({
+      effectivePermissionModeId: "default",
+      selectedPermissionModeId: "bypassPermissions",
+      permissionModePending: true,
+    });
+    expect(harnessConfigurationStateSchema.safeParse({ permissionModePending: true }).success).toBe(false);
     expect(
       threadPermissionModeSelectParamsSchema.parse({
         threadId: "thread-1",

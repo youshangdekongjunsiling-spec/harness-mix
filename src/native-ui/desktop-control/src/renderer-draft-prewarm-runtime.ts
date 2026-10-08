@@ -21,7 +21,10 @@ export interface RendererWebContents {
 interface SyncStatusElement {
   id: string;
   textContent: string | null;
+  parentElement?: SyncStatusElement | null;
   style: { cssText: string };
+  getAttribute?(name: string): string | null;
+  getClientRects?(): { length: number };
   setAttribute(name: string, value: string): void;
   remove(): void;
 }
@@ -30,7 +33,15 @@ export interface DraftPrewarmPolicyTarget {
   document?: {
     getElementById(id: string): SyncStatusElement | null;
     createElement(tag: string): SyncStatusElement;
-    body?: { appendChild(element: SyncStatusElement): unknown } | null;
+    querySelectorAll?(selector: string): Iterable<SyncStatusElement>;
+    body?: {
+      appendChild(element: SyncStatusElement): unknown;
+    } | null;
+  };
+  getComputedStyle?: (element: SyncStatusElement) => { display?: string; visibility?: string };
+  MutationObserver?: new (listener: () => void) => {
+    observe(target: unknown, options: Record<string, unknown>): void;
+    disconnect(): void;
   };
   [key: string]: unknown;
   addEventListener?: (type: string, listener: (event: Event) => void) => void;
@@ -116,6 +127,9 @@ export function installDraftPrewarmPolicyBridge(
   }
   const knownExternalThreadIds = new Set<string>();
   const knownOfficialThreadIds = new Set<string>();
+  const externalThreadTitles = new Map<string, string>();
+  const nativeHistorySyncNotices = new Map<string, "paused" | "error">();
+  const syncNoticeElementId = "harnessmix-sync-status";
   const catalogStore = isLocalSidecarHost ? manager.threadStore : undefined;
   const originalObserveCatalogThreads = catalogStore?.observeCatalogThreads;
   const originalRunRecentConversationRefresh = catalogStore?.runRecentConversationRefresh;
@@ -238,7 +252,50 @@ export function installDraftPrewarmPolicyBridge(
     if (value.modelProvider === "harnessmix" || value.cliVersion === "harnessmix") {
       knownExternalThreadIds.add(value.id);
       knownOfficialThreadIds.delete(value.id);
+      const title = typeof value.name === "string" ? value.name : value.title;
+      if (typeof title === "string" && title.trim()) externalThreadTitles.set(value.id, title.trim());
     }
+  };
+  const activeThreadId = (): string | null => {
+    const markers = target.document?.querySelectorAll?.(
+      "[data-above-composer-conversation-id]",
+    );
+    if (!markers) return null;
+    const visibleThreadIds = new Set<string>();
+    for (const marker of markers) {
+      const threadId = marker.getAttribute?.("data-above-composer-conversation-id");
+      if (!threadId) continue;
+      const composer = marker.parentElement ?? marker;
+      const style = target.getComputedStyle?.(composer);
+      if (style?.display === "none" || style?.visibility === "hidden") continue;
+      if (composer.getClientRects && composer.getClientRects().length === 0) continue;
+      visibleThreadIds.add(threadId);
+    }
+    return visibleThreadIds.size === 1 ? visibleThreadIds.values().next().value ?? null : null;
+  };
+  const renderNativeHistorySyncNotice = (): void => {
+    const noticeDocument = target.document;
+    if (!noticeDocument) return;
+    const previous = noticeDocument.getElementById(syncNoticeElementId);
+    const threadId = activeThreadId();
+    const status = threadId ? nativeHistorySyncNotices.get(threadId) : undefined;
+    if (!threadId || !status) {
+      previous?.remove();
+      return;
+    }
+    const notice = previous || noticeDocument.createElement("div");
+    if (!previous) {
+      notice.id = syncNoticeElementId;
+      notice.setAttribute("role", "status");
+      notice.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;max-width:420px;padding:12px 16px;background:#fff4d6;color:#443414;border:1px solid #b99a54;border-radius:8px;font:13px/1.5 system-ui;box-shadow:0 2px 12px #0003";
+    }
+    const title = externalThreadTitles.get(threadId);
+    const threadLabel = title ? `「${title}」` : `线程 ${threadId}`;
+    const text = status === "paused"
+      ? `Claude 历史同步已暂停（${threadLabel}）：源分支或本地记录发生变化。现有历史已保留，请检查后再继续同步。`
+      : `Claude 历史同步暂时失败（${threadLabel}），正在等待重试。现有历史已保留。`;
+    if (notice.textContent !== text) notice.textContent = text;
+    if (!previous) noticeDocument.body?.appendChild(notice);
   };
   const observeBridgeResult = (
     request: { method: string; parameters: unknown } | undefined,
@@ -278,6 +335,9 @@ export function installDraftPrewarmPolicyBridge(
     ) {
       knownExternalThreadIds.delete(request.parameters.threadId);
       knownOfficialThreadIds.delete(request.parameters.threadId);
+      externalThreadTitles.delete(request.parameters.threadId);
+      nativeHistorySyncNotices.delete(request.parameters.threadId);
+      renderNativeHistorySyncNotice();
     }
   };
   const handleBridgeFrame = (value: unknown): void => {
@@ -291,18 +351,13 @@ export function installDraftPrewarmPolicyBridge(
     }
     if (value.method === "harnessmix/thread/nativeHistorySync/updated" && isRecord(value.params)) {
       const status = value.params;
-      const noticeDocument = target.document;
-      if (noticeDocument && typeof status.threadId === "string") {
-        const elementId = "harnessmix-sync-status-" + status.threadId;
-        const previous = noticeDocument.getElementById(elementId);
+      if (typeof status.threadId === "string") {
         if (status.status === "paused" || status.status === "error") {
-          const notice = previous || noticeDocument.createElement("div");
-          notice.id = elementId;
-          notice.setAttribute("role", "status");
-          notice.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;max-width:420px;padding:12px 16px;background:#fff4d6;color:#443414;border:1px solid #b99a54;border-radius:8px;font:13px/1.5 system-ui;box-shadow:0 2px 12px #0003";
-          notice.textContent = status.status === "paused" ? "Claude 历史同步已暂停：源分支或本地记录发生变化。现有历史已保留，请检查后再继续同步。" : "Claude 历史同步暂时失败，正在等待重试。现有历史已保留。";
-          if (!previous) noticeDocument.body?.appendChild(notice);
-        } else if (status.status === "synced") previous?.remove();
+          nativeHistorySyncNotices.set(status.threadId, status.status);
+        } else {
+          nativeHistorySyncNotices.delete(status.threadId);
+        }
+        renderNativeHistorySyncNotice();
       }
       return;
     }
@@ -323,6 +378,15 @@ export function installDraftPrewarmPolicyBridge(
       if (value.method === "thread/started" && isRecord(value.params)) {
         rememberExternalThread(value.params.thread);
       }
+      if (
+        value.method === "thread/name/updated" &&
+        isRecord(value.params) &&
+        typeof value.params.threadId === "string" &&
+        typeof value.params.threadName === "string"
+      ) {
+        externalThreadTitles.set(value.params.threadId, value.params.threadName.trim());
+      }
+      renderNativeHistorySyncNotice();
       originalOnNotification.call(manager, value.method, value.params);
       return;
     }
@@ -800,6 +864,26 @@ export function installDraftPrewarmPolicyBridge(
     }
   }
 
+  const syncNoticeNavigationListener = (): void => renderNativeHistorySyncNotice();
+  target.addEventListener?.("popstate", syncNoticeNavigationListener);
+  target.addEventListener?.("hashchange", syncNoticeNavigationListener);
+  const syncNoticeNavigationObserver =
+    typeof target.MutationObserver === "function" && target.document?.body
+      ? new target.MutationObserver(syncNoticeNavigationListener)
+      : null;
+  syncNoticeNavigationObserver?.observe(target.document!.body, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: [
+      "data-above-composer-conversation-id",
+      "hidden",
+      "aria-hidden",
+      "style",
+      "class",
+    ],
+  });
+
   const policy = Object.freeze({
     state: "ready" as const,
     hostId,
@@ -867,6 +951,10 @@ export function installDraftPrewarmPolicyBridge(
       } else if (manager.onNotification === routedOnNotification) {
         manager.onNotification = originalOnNotification;
       }
+      target.removeEventListener?.("popstate", syncNoticeNavigationListener);
+      target.removeEventListener?.("hashchange", syncNoticeNavigationListener);
+      syncNoticeNavigationObserver?.disconnect();
+      target.document?.getElementById(syncNoticeElementId)?.remove();
       if (responseMethod && manager[responseMethod] === routedDispatchAppServerResponse) {
         manager[responseMethod] = originalDispatchAppServerResponse;
       }
@@ -886,6 +974,8 @@ export function installDraftPrewarmPolicyBridge(
       bridgeServerRequests.clear();
       knownExternalThreadIds.clear();
       knownOfficialThreadIds.clear();
+      externalThreadTitles.clear();
+      nativeHistorySyncNotices.clear();
       threadOwnershipResolutions.clear();
       selectedModel = null;
       selectedCodexAccountId = null;

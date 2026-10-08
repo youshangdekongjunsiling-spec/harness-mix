@@ -626,8 +626,8 @@ function create() {
     },
     async setPermissionMode(session, mode) {
       const normalized = normalizeClaudePermissionMode(mode);
-      session.permissionMode = normalized;
       await session.query?.setPermissionMode(normalized);
+      session.permissionMode = normalized;
     },
     async setThinkingLevel(session, level) {
       const models = await this.listModelsFor(session);

@@ -207,6 +207,8 @@ export const harnessConfigurationStateSchema = z
     effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
     availableThinkingOptions: thinkingOptionsWithUniqueIds.optional(),
     effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
+    selectedPermissionModeId: harnessPermissionModeIdSchema.optional(),
+    permissionModePending: z.boolean().optional(),
   })
   .strict()
   .superRefine((state, ctx) => {
@@ -219,6 +221,13 @@ export const harnessConfigurationStateSchema = z
         code: "custom",
         message: "Effective Thinking option must be currently available",
         path: ["effectiveThinkingOptionId"],
+      });
+    }
+    if (state.permissionModePending && !state.selectedPermissionModeId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "A pending Permission Mode requires the user's selected mode",
+        path: ["selectedPermissionModeId"],
       });
     }
   });
@@ -338,6 +347,8 @@ const externalThreadInspectionSchema = z
     effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
     availableThinkingOptions: thinkingOptionsWithUniqueIds.optional(),
     effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
+    selectedPermissionModeId: harnessPermissionModeIdSchema.optional(),
+    permissionModePending: z.boolean().optional(),
     history: harnessHistoryCapabilitiesSchema,
     workspace: z
       .object({

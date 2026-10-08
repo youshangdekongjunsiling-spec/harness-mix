@@ -386,6 +386,12 @@ function thinkingOptionInSelection(
     : undefined;
 }
 
+function permissionModeInSelection(
+  inspection: Extract<ThreadInspection, { owner: "external" }>,
+): HarnessPermissionModeId | undefined {
+  return inspection.selectedPermissionModeId ?? inspection.effectivePermissionModeId;
+}
+
 export function draftThinkingOptionForModel(
   catalog: HarnessModelCatalog,
   model: HarnessModelRef,
@@ -460,7 +466,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "pi",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId,
+      permissionModeInSelection(inspection),
     );
   }
   if (inspection.harnessId === "grok") {
@@ -472,7 +478,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "grok",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "omp") {
@@ -482,7 +488,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "omp",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "claude-code") {
@@ -494,7 +500,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "claude-code",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "deepseek-harness") {
@@ -506,7 +512,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "deepseek-harness",
       inspection.effectiveModel ?? transportSelection.model,
       undefined,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "opencode") {
@@ -518,7 +524,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "opencode",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "antigravity") {
@@ -530,7 +536,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       "antigravity",
       inspection.effectiveModel ?? transportSelection.model,
       thinkingOptionInSelection(inspection) ?? transportSelection.thinkingOptionId,
-      inspection.effectivePermissionModeId ?? transportSelection.permissionModeId,
+      permissionModeInSelection(inspection) ?? transportSelection.permissionModeId,
     );
   }
   if (inspection.harnessId === "kiro-cli") {
@@ -544,7 +550,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       inspection.availableThinkingOptions !== undefined
         ? thinkingOptionInSelection(inspection)
         : (inspection.effectiveThinkingOptionId ?? route.thinkingOptionId),
-      inspection.effectivePermissionModeId ?? route.permissionModeId,
+      permissionModeInSelection(inspection) ?? route.permissionModeId,
     );
   }
   if (inspection.harnessId === "openclaw" || inspection.harnessId === "hermes" || inspection.harnessId === 'codex-harness' || inspection.harnessId === 'qoder' || inspection.harnessId === 'codebuddy' || inspection.harnessId === 'zcode' || inspection.harnessId === 'trae' || inspection.harnessId === 'cursor-cli' || inspection.harnessId === 'cline' || inspection.harnessId === 'kimi-code') {
@@ -559,7 +565,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
       inspection.availableThinkingOptions !== undefined
         ? thinkingOptionInSelection(inspection)
         : (inspection.effectiveThinkingOptionId ?? route.thinkingOptionId),
-      inspection.effectivePermissionModeId ?? route.permissionModeId,
+      permissionModeInSelection(inspection) ?? route.permissionModeId,
     );
   }
   throw new Error("Thread owner is not a Renderer Agent");
@@ -1542,6 +1548,10 @@ export function installRendererBindingProbe(
           ...(inspection.effectivePermissionModeId
             ? { effectivePermissionModeId: inspection.effectivePermissionModeId }
             : {}),
+          ...(inspection.selectedPermissionModeId
+            ? { selectedPermissionModeId: inspection.selectedPermissionModeId }
+            : {}),
+          ...(inspection.permissionModePending ? { permissionModePending: true } : {}),
         };
         mounted.modelView = { status: "loading" };
         mounted.permissionModeView = { status: "loading" };
@@ -1853,7 +1863,8 @@ export function installRendererBindingProbe(
           current.phase === "locked"
             ? lockedPermissionMode(
                 permissionModes,
-                mounted.threadConfiguration?.effectivePermissionModeId,
+                mounted.threadConfiguration?.selectedPermissionModeId ??
+                  mounted.threadConfiguration?.effectivePermissionModeId,
                 previousPermissionModeId,
               )
             : undefined;
@@ -1892,6 +1903,10 @@ export function installRendererBindingProbe(
             status: "ready",
             catalog: mounted.permissionModeView.catalog,
             selected: selectedPermissionModeId,
+            ...(mounted.threadConfiguration?.effectivePermissionModeId
+              ? { effective: mounted.threadConfiguration.effectivePermissionModeId }
+              : {}),
+            ...(mounted.threadConfiguration?.permissionModePending ? { pending: true } : {}),
             ...permissionModeLock,
           };
         }
@@ -1910,6 +1925,10 @@ export function installRendererBindingProbe(
             status: "ready",
             catalog: mounted.permissionModeView.catalog,
             selected: selectedPermissionModeId,
+            ...(mounted.threadConfiguration?.effectivePermissionModeId
+              ? { effective: mounted.threadConfiguration.effectivePermissionModeId }
+              : {}),
+            ...(mounted.threadConfiguration?.permissionModePending ? { pending: true } : {}),
             ...permissionModeLock,
           };
         }
@@ -1985,6 +2004,10 @@ export function installRendererBindingProbe(
           status: "ready",
           catalog: mounted.permissionModeView.catalog,
           selected: selectedPermissionModeId,
+          ...(mounted.threadConfiguration?.effectivePermissionModeId
+            ? { effective: mounted.threadConfiguration.effectivePermissionModeId }
+            : {}),
+          ...(mounted.threadConfiguration?.permissionModePending ? { pending: true } : {}),
           ...permissionModeLock,
         };
       }
@@ -2107,7 +2130,7 @@ export function installRendererBindingProbe(
           : catalog;
         resolvedModelLabel = state.resolvedModelLabel;
         const effectivePermissionModeId =
-          state.effectivePermissionModeId ?? previousPermissionModeId;
+          state.selectedPermissionModeId ?? state.effectivePermissionModeId ?? previousPermissionModeId;
         if (
           !writeExternalConfiguration(
             mounted,
@@ -2125,7 +2148,9 @@ export function installRendererBindingProbe(
       controller.setExternalModel(mounted.composer, agent, effectiveModel);
       controller.setExternalThinkingOption(mounted.composer, agent, effectiveThinkingOptionId);
       const effectivePermissionModeId =
-        mounted.threadConfiguration?.effectivePermissionModeId ?? previousPermissionModeId;
+        mounted.threadConfiguration?.selectedPermissionModeId ??
+        mounted.threadConfiguration?.effectivePermissionModeId ??
+        previousPermissionModeId;
       if (effectivePermissionModeId) {
         controller.setExternalPermissionMode(mounted.composer, agent, effectivePermissionModeId);
       }
@@ -2244,13 +2269,15 @@ export function installRendererBindingProbe(
         ) {
           return;
         }
+        const selectedStatePermissionModeId =
+          state.selectedPermissionModeId ?? state.effectivePermissionModeId;
         if (
-          !state.effectivePermissionModeId ||
-          !catalog.modes.some(({ id }) => id === state.effectivePermissionModeId)
+          !selectedStatePermissionModeId ||
+          !catalog.modes.some(({ id }) => id === selectedStatePermissionModeId)
         ) {
           throw new Error("External Harness did not report a selectable Permission Mode");
         }
-        effectivePermissionModeId = state.effectivePermissionModeId;
+        effectivePermissionModeId = selectedStatePermissionModeId;
         if (
           !writeExternalConfiguration(
             mounted,
@@ -2281,6 +2308,10 @@ export function installRendererBindingProbe(
         status: "ready",
         catalog,
         selected: effectivePermissionModeId,
+        ...(mounted.threadConfiguration?.effectivePermissionModeId
+          ? { effective: mounted.threadConfiguration.effectivePermissionModeId }
+          : {}),
+        ...(mounted.threadConfiguration?.permissionModePending ? { pending: true } : {}),
       };
     } catch (error) {
       if (!isLiveModelRequest(mounted, generation)) return;
@@ -2391,7 +2422,7 @@ export function installRendererBindingProbe(
             agent,
             model,
             effectiveThinkingOptionId,
-            state.effectivePermissionModeId ?? permissionModeId,
+            state.selectedPermissionModeId ?? state.effectivePermissionModeId ?? permissionModeId,
           )
         ) {
           throw new Error("Confirmed external Thinking could not be applied to the Composer");
@@ -2401,7 +2432,9 @@ export function installRendererBindingProbe(
       if (!isLiveModelRequest(mounted, generation)) return;
       controller.setExternalThinkingOption(mounted.composer, agent, effectiveThinkingOptionId);
       const effectivePermissionModeId =
-        mounted.threadConfiguration?.effectivePermissionModeId ?? permissionModeId;
+        mounted.threadConfiguration?.selectedPermissionModeId ??
+        mounted.threadConfiguration?.effectivePermissionModeId ??
+        permissionModeId;
       if (effectivePermissionModeId) {
         controller.setExternalPermissionMode(mounted.composer, agent, effectivePermissionModeId);
       }

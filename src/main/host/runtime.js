@@ -673,31 +673,38 @@ class HostRuntime {
   async setOptions(threadId, options) {
     const thread = this.#requireThread(threadId);
     const session = this.sessions.get(threadId);
-    if (options.permissionMode && session && typeof session.adapter.setPermissionMode === "function" && !this.execution.isRunning(threadId)) {
-      await session.adapter.setPermissionMode(session, options.permissionMode);
-      session.queuedPermissionModeApplied = options.permissionMode;
+    const permissionMode = options.permissionMode;
+    const permissionModeAlreadyEffective = permissionMode && thread.options?.effectivePermissionMode === permissionMode;
+    const canApplyPermissionMode = permissionMode && session && typeof session.adapter.setPermissionMode === "function" && !this.execution.isRunning(threadId);
+    if (canApplyPermissionMode) {
+      await session.adapter.setPermissionMode(session, permissionMode);
+      session.queuedPermissionModeApplied = permissionMode;
     }
     thread.options = { ...thread.options, ...options };
+    if (permissionMode) {
+      thread.options.permissionModePending = !(canApplyPermissionMode || permissionModeAlreadyEffective);
+      if (canApplyPermissionMode) thread.options.effectivePermissionMode = permissionMode;
+      if (permissionModeAlreadyEffective && session) session.queuedPermissionModeApplied = permissionMode;
+    }
     await this.#save();
     this.#broadcast();
     return thread.options;
   }
 
   /**
-   * 投递前应用挂起的权限模式（回合运行中选择的档位）。失败不阻断回合：保持挂起、
-   * 下轮投递前重试；期间原生审批仍经 respond() 走 Desktop 权限卡，不代作决定。
+   * 投递前应用挂起的权限模式（回合运行中选择的档位）。失败时保持挂起并阻止
+   * 本轮投递，避免界面选择与原生实际权限不一致；原生审批仍经 respond() 走 Desktop 权限卡。
    */
   async #applyQueuedPermissionMode(thread, session) {
     const mode = thread.options?.permissionMode;
     if (!mode || !session || typeof session.adapter?.setPermissionMode !== "function") return;
     if (session.queuedPermissionModeApplied === mode) return;
-    try {
-      await session.adapter.setPermissionMode(session, mode);
-      session.queuedPermissionModeApplied = mode;
-    } catch (error) {
-      if (this.collaboration.isTeamParticipantThread(thread.id)) throw error;
-      // 一次性委派保留原生审批回落；团队成员必须在免询问档生效后再投递。
-    }
+    await session.adapter.setPermissionMode(session, mode);
+    session.queuedPermissionModeApplied = mode;
+    thread.options.effectivePermissionMode = mode;
+    thread.options.permissionModePending = false;
+    await this.#save();
+    this.#broadcast();
   }
 
   /** 任务 Fork：由 Adapter 向原生程序申请分叉出新会话，Host 建立新任务卡片 */
@@ -1159,6 +1166,11 @@ class HostRuntime {
       delete thread.error;
       delete thread.errorKind;
       this.sessions.set(thread.id, attachSession(adapter, session, thread.id));
+      if (thread.options?.permissionMode) {
+        session.queuedPermissionModeApplied = thread.options.permissionMode;
+        thread.options.effectivePermissionMode = thread.options.permissionMode;
+        thread.options.permissionModePending = false;
+      }
       if (thread.pendingHandoff?.checkpointId) {
         thread.pendingHandoff.phase = 'ready';
         await this.handoffs.mark(thread.id, thread.pendingHandoff.checkpointId, 'ready');

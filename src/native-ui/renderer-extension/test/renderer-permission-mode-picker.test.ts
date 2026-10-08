@@ -241,6 +241,24 @@ describe("Renderer Permission Mode picker presentation", () => {
         selected: harnessPermissionModeIdSchema.parse("plan"),
       }),
     ).toBe("Plan mode");
+    expect(
+      rendererPermissionModeLabel({
+        status: "ready",
+        catalog,
+        selected: harnessPermissionModeIdSchema.parse("bypassPermissions"),
+        effective: harnessPermissionModeIdSchema.parse("default"),
+        pending: true,
+      }),
+    ).toBe("Bypass permissions (next turn; currently Default)");
+    expect(
+      rendererPermissionModeLabel({
+        status: "ready",
+        catalog,
+        selected: harnessPermissionModeIdSchema.parse("bypassPermissions"),
+        effective: harnessPermissionModeIdSchema.parse("default"),
+        pending: true,
+      }, "zh-CN"),
+    ).toBe("绕过权限 (下轮生效; 当前 默认)");
     expect(rendererPermissionModeLabel({ status: "loading" })).toBe("Loading permissions...");
     expect(rendererPermissionModeLabel({ status: "loading" }, "zh-CN")).toBe("正在加载权限...");
     expect(rendererPermissionModeLabel({ status: "error", error: "offline" }, "zh-CN")).toBe(

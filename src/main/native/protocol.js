@@ -501,13 +501,18 @@ class NativeProtocol {
       : globalLevels;
     const thinking = thread.options?.thinking;
     const selectedLabel = selectedEntry ? (selectedEntry.name || selectedEntry.id) : (typeof selected === 'object' && selected ? (selected.name || selected.id) : selected);
+    const selectedPermissionMode = thread.options?.permissionMode;
+    const effectivePermissionMode = thread.options?.effectivePermissionMode ??
+      (thread.options?.permissionModePending ? undefined : selectedPermissionMode);
     return { ...(selected ? { effectiveModel: modelRef(selected) } : {}),
       // 渲染端目录未命中时兜底显示模型名（composer 优先用 resolvedModelLabel）
       ...(selectedLabel ? { resolvedModelLabel: String(selectedLabel) } : {}),
       // 可选集合存在时，生效档位必须属于其中（共享契约校验）；目录未加载时保留原样
       ...(thinking && (!thinkingOptions.length || thinkingOptions.some(o => o.id === thinking)) ? { effectiveThinkingOptionId: thinking } : {}),
       ...(thinkingOptions.length ? { availableThinkingOptions: thinkingOptions } : {}),
-      ...(thread.options?.permissionMode ? { effectivePermissionModeId: thread.options.permissionMode } : {}) };
+      ...(effectivePermissionMode ? { effectivePermissionModeId: effectivePermissionMode } : {}),
+      ...(selectedPermissionMode ? { selectedPermissionModeId: selectedPermissionMode } : {}),
+      ...(thread.options?.permissionModePending === true ? { permissionModePending: true } : {}) };
   }
   async resolveModel(harnessId, ref) {
     if (!ref) return undefined;
@@ -952,7 +957,11 @@ class NativeProtocol {
       if (method.startsWith('harnessmix/')) throw new Error(`Harness Mix does not implement ${method}`);
       return undefined;
     }
-    if (method === 'thread/read') return { thread: this.projectThread(thread, params.includeTurns !== false) };
+    if (method === 'thread/read') {
+      const result = { thread: this.projectThread(thread, params.includeTurns !== false) };
+      setImmediate(() => this.#replayPendingApprovals(thread));
+      return result;
+    }
     // Desktop 26.1002 hydrates sidebar rows with this read immediately after
     // thread/list. Harness Mix does not persist a separate native attachment
     // catalog, so expose the stock app-server's empty paginated shape.
@@ -1048,9 +1057,11 @@ class NativeProtocol {
     if (method === 'thread/resume') {
       // 回显线程实际生效的权限（Desktop 据此渲染 composer 权限指示），而不是硬编码默认值
       const perms = thread.options?.turnPermissions ?? null;
-      return { thread: this.projectThread(thread), model: this.threadRouteModel(thread), modelProvider: 'harness-mix', cwd: thread.cwd,
+      const result = { thread: this.projectThread(thread), model: this.threadRouteModel(thread), modelProvider: 'harness-mix', cwd: thread.cwd,
         approvalPolicy: perms?.approvalPolicy ?? 'on-request', approvalsReviewer: perms?.approvalsReviewer ?? null,
         sandbox: perms?.sandboxPolicy ?? { type: 'workspaceWrite', writableRoots: [thread.cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }, reasoningEffort: null };
+      setImmediate(() => this.#replayPendingApprovals(thread));
+      return result;
     }
     if (method === 'turn/start') {
       const { text, attachments } = await prepareInput(params.input, thread.cwd);
@@ -1123,8 +1134,8 @@ class NativeProtocol {
     }
     if (method === 'harnessmix/thread/model/select') { await this.runtime.setModel(thread.id, await this.resolveModel(thread.harnessId, params.model)); return this.configuration(thread); }
     if (method === 'harnessmix/thread/thinking/select') { await this.runtime.setThinking(thread.id, params.thinkingOptionId); return this.configuration(thread); }
-    // 权限模式：空闲时 setOptions 内热应用到原生会话；回合运行中记录为挂起档位
-    // （下轮投递前应用），两种情况都立即返回新档位为生效值。
+    // 权限模式：空闲时 setOptions 内热应用到原生会话；回合运行中记录为挂起档位，
+    // 并分别返回用户选择与原生实际生效值。
     if (method === 'harnessmix/thread/permission-mode/select') {
       await this.runtime.setOptions(thread.id, { permissionMode: params.permissionModeId });
       return this.configuration(thread);
@@ -1188,16 +1199,7 @@ class NativeProtocol {
           if (oldest) this.published.delete(oldest);
         }
       }
-      if (['approval', 'question'].includes(item.type) && event.type === 'item.started') {
-        const id = `harness-mix:approval:${item.id}`;
-        this.approvals.set(id, { threadId, requestId: item.requestId, item });
-        const question = item.type === 'question' || item.method === 'select';
-        this.emit({ id, method: question ? 'item/tool/requestUserInput' : 'item/commandExecution/requestApproval', params: {
-          threadId, turnId, itemId: item.id,
-          ...(question ? { questions: [{ id: item.requestId, header: 'Harness', question: item.message || item.title || 'Native Harness input', isOther: true, isSecret: false,
-            options: item.options?.map(o => ({ label: typeof o === 'string' ? o : o.label || o.id, description: typeof o === 'string' ? o : o.description || o.label || o.id })) || null }] }
-            : { reason: item.message || item.title, command: null, cwd: this.thread(threadId)?.cwd, availableDecisions: ['accept', 'decline'] }) } });
-      }
+      if (['approval', 'question'].includes(item.type) && event.type === 'item.started') this.#emitApprovalRequest(threadId, turnId, item);
     }
     if (event.type === 'turn.waiting') notify('thread/status/changed', { status: { type: 'active', activeFlags: [] } });
     if (event.type === 'turn.resumed') notify('thread/status/changed', { status: { type: 'active', activeFlags: [] } });
@@ -1223,6 +1225,25 @@ class NativeProtocol {
           }
         }, 2500);
       }
+    }
+  }
+  #emitApprovalRequest(threadId, turnId, item) {
+    const id = `harness-mix:approval:${item.id}`;
+    this.approvals.set(id, { threadId, requestId: item.requestId, item });
+    const question = item.type === 'question' || item.method === 'select';
+    this.emit({ id, method: question ? 'item/tool/requestUserInput' : 'item/commandExecution/requestApproval', params: {
+      threadId, turnId, itemId: item.id,
+      ...(question ? { questions: [{ id: item.requestId, header: 'Harness', question: item.message || item.title || 'Native Harness input', isOther: true, isSecret: false,
+        options: item.options?.map(o => ({ label: typeof o === 'string' ? o : o.label || o.id, description: typeof o === 'string' ? o : o.description || o.label || o.id })) || null }] }
+        : { reason: item.message || item.title, command: null, cwd: this.thread(threadId)?.cwd, availableDecisions: ['accept', 'decline'] }) } });
+  }
+  #replayPendingApprovals(thread) {
+    // Persisted interactions are cleared during Host recovery. Replay only while
+    // the original live adapter session is still connected and can accept respond().
+    if (!this.runtime.sessions.has(thread.id) || !this.runtime.execution.isRunning(thread.id)) return;
+    for (const item of this.runtime.core.interactions.pending(thread.id)) {
+      if (!['approval', 'question'].includes(item.type)) continue;
+      this.#emitApprovalRequest(thread.id, item.turnId, item);
     }
   }
   async startQueuedSubmission(thread, submission) {

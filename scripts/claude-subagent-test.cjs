@@ -67,6 +67,15 @@ const {
     assert.match(configuredInspection.detail, /Claude Code 9\.9\.9/);
     assert.match(configuredInspection.detail, /HARNESSMIX_CLAUDE_COMMAND/);
 
+    const permissionAdapter = create();
+    const permissionSession = {
+      permissionMode: 'default',
+      query: { async setPermissionMode() { throw new Error('native busy'); } },
+    };
+    await assert.rejects(permissionAdapter.setPermissionMode(permissionSession, 'acceptEdits'), /native busy/);
+    assert.equal(permissionSession.permissionMode, 'default',
+      'a rejected SDK transition must not mutate the adapter effective mode');
+
     delete process.env.HARNESSMIX_CLAUDE_COMMAND;
     let defaultOptions;
     const defaultSession = spawnSession({

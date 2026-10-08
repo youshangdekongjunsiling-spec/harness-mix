@@ -139,6 +139,67 @@ describe("Desktop connection snapshot discovery", () => {
     expect(onNotification).toHaveBeenCalledWith("thread/name/updated",
       { threadId: "parked-1", threadName: "After" });
   });
+  it("shows Claude sync failures only on their active thread and clears stale notices", () => {
+    const fixture = syncStatusTargetFixture("external-a");
+    const manager = requestManagerFixture();
+    let disposed = false;
+    try {
+      installDraftPrewarmPolicyBridge(manager, requestBridgeFixture(), "local", fixture.target,
+        { discardAllPrewarmedThreads: vi.fn() });
+      fixture.deliver({
+        method: "thread/started",
+        params: { thread: { id: "external-a", modelProvider: "harnessmix", name: "Alpha" } },
+      });
+      fixture.deliver({
+        method: "thread/started",
+        params: { thread: { id: "external-b", modelProvider: "harnessmix", name: "Beta" } },
+      });
+
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-a", status: "paused" },
+      });
+      expect(fixture.notice()?.textContent).toContain("Alpha");
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error" },
+      });
+      expect(fixture.notice()?.textContent).toContain("Alpha");
+
+      fixture.navigate("external-b");
+      expect(fixture.notice()?.textContent).toContain("Beta");
+      expect(fixture.notice()?.textContent).toContain("等待重试");
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "waiting" },
+      });
+      expect(fixture.notice()).toBeNull();
+
+      fixture.navigate("external-a");
+      expect(fixture.notice()?.textContent).toContain("Alpha");
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-a", status: "synced" },
+      });
+      expect(fixture.notice()).toBeNull();
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-a", status: "error" },
+      });
+      expect(fixture.notice()).not.toBeNull();
+      fixture.navigate("official-thread");
+      expect(fixture.notice()).toBeNull();
+      (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
+      disposed = true;
+      expect(fixture.observerDisconnect).toHaveBeenCalledOnce();
+      expect(fixture.notice()).toBeNull();
+    } finally {
+      if (!disposed) {
+        (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void } | undefined)
+          ?.dispose();
+      }
+    }
+  });
   it("explicitly rejects unsupported remote approval hooks before changing transport", () => {
     const bridge = requestBridgeFixture();
     const send = bridge.sendRequest;
@@ -300,6 +361,98 @@ function writtenBridgeFrames(directSend: ReturnType<typeof vi.fn>): Record<strin
         unknown
       >;
     });
+}
+
+function syncStatusTargetFixture(initialThreadId: string): {
+  target: DraftPrewarmPolicyTarget;
+  notice(): { id: string; textContent: string | null } | null;
+  navigate(threadId: string): void;
+  deliver(value: Record<string, unknown>): void;
+  observerDisconnect: ReturnType<typeof vi.fn>;
+} {
+  let activeThreadId = initialThreadId;
+  let mutationListener: (() => void) | null = null;
+  const observerDisconnect = vi.fn();
+  const notices = new Map<string, {
+    id: string;
+    textContent: string | null;
+    style: { cssText: string };
+    setAttribute(name: string, value: string): void;
+    remove(): void;
+  }>();
+  const composer = {
+    id: "composer",
+    textContent: null,
+    style: { cssText: "" },
+    setAttribute: vi.fn(),
+    remove: vi.fn(),
+    getClientRects: () => ({ length: 1 }),
+  };
+  const marker = {
+    id: "marker",
+    textContent: null,
+    parentElement: composer,
+    style: { cssText: "" },
+    getAttribute: (name: string) =>
+      name === "data-above-composer-conversation-id" ? activeThreadId : null,
+    setAttribute: vi.fn(),
+    remove: vi.fn(),
+  };
+  const listeners = new Map<string, Set<(event: Event) => void>>();
+  const target: DraftPrewarmPolicyTarget = {
+    __harnessmixSidecarModeV1: true,
+    __harnessmixSidecarSendV1: vi.fn(),
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    MutationObserver: class {
+      constructor(listener: () => void) {
+        mutationListener = listener;
+      }
+      observe(): void {}
+      disconnect(): void {
+        observerDisconnect();
+      }
+    },
+    document: {
+      getElementById: (id) => notices.get(id) ?? null,
+      querySelectorAll: () => [marker],
+      createElement: () => {
+        const element = {
+          id: "",
+          textContent: null as string | null,
+          style: { cssText: "" },
+          setAttribute: vi.fn(),
+          remove: () => notices.delete(element.id),
+        };
+        return element;
+      },
+      body: {
+        appendChild: (element) => {
+          notices.set(element.id, element as ReturnType<typeof notices.get> & object);
+          return element;
+        },
+      },
+    },
+    addEventListener(type, listener) {
+      const registered = listeners.get(type) ?? new Set();
+      registered.add(listener);
+      listeners.set(type, registered);
+    },
+    removeEventListener(type, listener) {
+      listeners.get(type)?.delete(listener);
+    },
+  };
+  return {
+    target,
+    notice: () => notices.get("harnessmix-sync-status") ?? null,
+    navigate(threadId) {
+      activeThreadId = threadId;
+      mutationListener?.();
+    },
+    deliver(value) {
+      (target.__harnessmixSidecarReceiveV1 as (frame: string) => void)(JSON.stringify(value));
+    },
+    observerDisconnect,
+  };
 }
 
 function rendererFixture(

@@ -236,10 +236,37 @@ async function main() {
     const emptyQ = events.filter(e => e.method === 'item/tool/requestUserInput').at(-1);
     await bridge.respond({ id: emptyQ.id, result: { answers: { empty: { answers: [] } } } });
     assert.equal(answers[3].answer.value, '', '空答案数组回退为空字符串而非 undefined');
-    // 权限模式（回合运行中，原生正忙/等审批）：选择立即接受为挂起档位并回报生效值，
+    emit({ kind: 'approval', requestId: 'replay', method: 'confirm', title: 'Replay?' });
+    const replayApprovalId = events.filter(e => e.id?.startsWith('harness-mix:approval:')).at(-1).id;
+    const replayCount = events.filter(e => e.id === replayApprovalId).length;
+    await bridge.request('thread/read', { threadId });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.filter(e => e.id === replayApprovalId).length, replayCount + 1,
+      'thread hydration replays a still-live actionable approval request with the stable id');
+    await bridge.respond({ id: replayApprovalId, result: { decision: 'decline' } });
+    assert.deepEqual(answers[4], { id: 'replay', answer: { confirmed: false } });
+    await bridge.request('thread/resume', { threadId });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.filter(e => e.id === replayApprovalId).length, replayCount + 1,
+      'resolved approvals are not replayed during later hydration');
+    emit({ kind: 'approval', requestId: 'disconnected', method: 'confirm', title: 'Disconnected?' });
+    const disconnectedApprovalId = events.filter(e => e.id?.startsWith('harness-mix:approval:')).at(-1).id;
+    const disconnectedCount = events.filter(e => e.id === disconnectedApprovalId).length;
+    const liveSession = runtime.sessions.get(threadId);
+    runtime.sessions.delete(threadId);
+    await bridge.request('thread/read', { threadId });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.filter(e => e.id === disconnectedApprovalId).length, disconnectedCount,
+      'a persisted interaction without its original live adapter session is never replayed');
+    runtime.sessions.set(threadId, liveSession);
+    await bridge.respond({ id: disconnectedApprovalId, result: { decision: 'decline' } });
+    assert.deepEqual(answers[5], { id: 'disconnected', answer: { confirmed: false } });
+    // 权限模式（回合运行中）：保留用户选择，同时继续回报原生实际生效值，
     // 不向原生会话热应用（CodeBuddy 等会因 turn 进行中拒绝配置）
     const queuedMode = await bridge.request('harnessmix/thread/permission-mode/select', { threadId, permissionModeId: 'bypassPermissions' });
-    assert.equal(queuedMode.effectivePermissionModeId, 'bypassPermissions', '回合运行中的权限模式选择被接受为生效档位');
+    assert.equal(queuedMode.selectedPermissionModeId, 'bypassPermissions', '回合运行中的权限模式选择被保留');
+    assert.equal(queuedMode.effectivePermissionModeId, undefined, '挂起选择不冒充原生实际生效档位');
+    assert.equal(queuedMode.permissionModePending, true);
     assert.deepEqual(permissionModeCalls, [], '回合运行中不向原生会话热应用权限模式');
     emit({ kind: 'file-change', changes: [{ path: 'a.txt', changeType: 'added', before: '', after: 'hello', complete: true }] });
     emit({ kind: 'completed', finalAnswer: true });
@@ -288,6 +315,10 @@ async function main() {
     await bridge.request('thread/unarchive', { threadId });
     await bridge.request('turn/start', { threadId, input: [{ type: 'text', text: 'cancel' }] });
     assert.deepEqual(permissionModeCalls, ['bypassPermissions'], '挂起的权限模式在下轮投递前应用到原生会话');
+    const appliedMode = await bridge.request('harnessmix/thread/inspect', { threadId });
+    assert.equal(appliedMode.effectivePermissionModeId, 'bypassPermissions');
+    assert.equal(appliedMode.selectedPermissionModeId, 'bypassPermissions');
+    assert.equal(appliedMode.permissionModePending, undefined);
     await bridge.request('turn/interrupt', { threadId });
     await wait(() => !runtime.threads.find(t => t.id === threadId).reviewPending && !runtime.sending.has(threadId));
     assert.equal(events.filter(e => e.method === 'turn/completed').at(-1).params.turn.status, 'interrupted');

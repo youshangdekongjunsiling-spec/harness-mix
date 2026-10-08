@@ -969,6 +969,8 @@ describe("Renderer Composer DOM behavior", () => {
         effectiveThinkingOptionId: thinkingOptionId,
         availableThinkingOptions: [{ id: thinkingOptionId, label: "High" }],
         effectivePermissionModeId: harnessPermissionModeIdSchema.parse("acceptEdits"),
+        selectedPermissionModeId: harnessPermissionModeIdSchema.parse("bypassPermissions"),
+        permissionModePending: true,
         resolvedModelLabel: "runtime-custom",
         locked: true,
       }),
@@ -976,7 +978,7 @@ describe("Renderer Composer DOM behavior", () => {
       agent: "claude-code",
       model: { id: "claude-model-v1.c29ubmV0" },
       thinkingOptionId: "high",
-      permissionModeId: "acceptEdits",
+      permissionModeId: "bypassPermissions",
     });
     expect(
       restoredThreadOwnership({

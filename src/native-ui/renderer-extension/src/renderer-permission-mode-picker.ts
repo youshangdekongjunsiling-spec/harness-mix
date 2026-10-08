@@ -31,6 +31,8 @@ export interface RendererPermissionModeControlView {
   status: "idle" | "loading" | "ready" | "selecting" | "unsupported" | "error";
   catalog?: HarnessPermissionModeCatalog;
   selected?: HarnessPermissionModeId;
+  effective?: HarnessPermissionModeId;
+  pending?: boolean;
   error?: string;
   selectionLocked?: boolean;
   selectionLockedReason?: string;
@@ -87,8 +89,16 @@ export function rendererPermissionModeLabel(
   locale: RendererSettingsLocale = "en",
 ): string {
   const selected = selectedMode(view);
-  if (selected) return rendererPermissionModePresentation(selected, locale).label;
   const messages = rendererHarnessMessages(locale);
+  if (selected) {
+    const label = rendererPermissionModePresentation(selected, locale).label;
+    if (!view.pending) return label;
+    const effective = view.catalog?.modes.find(({ id }) => id === view.effective);
+    const current = effective
+      ? `; ${messages.permissionModeCurrently} ${rendererPermissionModePresentation(effective, locale).label}`
+      : "";
+    return `${label} (${messages.permissionModePending}${current})`;
+  }
   if (view.status === "loading") return messages.loadingPermissions;
   if (view.status === "selecting") return messages.selecting;
   if (view.status === "error") return messages.permissionsUnavailable;
