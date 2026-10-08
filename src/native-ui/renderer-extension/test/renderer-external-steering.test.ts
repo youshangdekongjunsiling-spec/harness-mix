@@ -13,6 +13,8 @@ function fixture(owner: "external" | "codex" = "external") {
     steeringItems: [],
   };
   const turns = [originalTurn];
+  const loadMessages = vi.fn(async () => undefined);
+  const hasPendingTurnStart = vi.fn(() => false);
   const rpc = vi.fn(
     async (method: unknown, params: unknown, options?: unknown): Promise<unknown> => {
       void options;
@@ -43,7 +45,7 @@ function fixture(owner: "external" | "codex" = "external") {
       .mockResolvedValue({ turnId: "official" }),
     getStreamRole: vi.fn(() => ({ role: "owner" })),
     getTurnCoordinator: () => ({
-      loadMessages: async () => undefined,
+      loadMessages,
       readMessages: () => queued,
       mutate: (_threadId: string, update: (messages: typeof queued) => typeof queued) => {
         queued = update(queued);
@@ -52,7 +54,7 @@ function fixture(owner: "external" | "codex" = "external") {
         submissionHost: {
           getActiveTurnId: () =>
             turns.at(-1)?.status === "inProgress" ? turns.at(-1)?.turnId : null,
-          hasPendingTurnStart: () => false,
+          hasPendingTurnStart,
         },
       },
     }),
@@ -103,6 +105,8 @@ function fixture(owner: "external" | "codex" = "external") {
     originalSteer,
     dispose,
     requestOptions,
+    loadMessages,
+    hasPendingTurnStart,
     queue: {
       read: () => queued,
       set: (messages: typeof queued) => {
@@ -139,6 +143,54 @@ describe("external direction changes use normal Desktop start presentation", () 
       { timeoutMs: 30_000 },
     );
     expect(f.args[8]).toHaveBeenCalledOnce();
+    f.dispose();
+  });
+
+  it("starts one idle follow-up without waiting for a stuck queue snapshot", async () => {
+    const f = fixture();
+    f.turns[0]!.status = "completed";
+    // Desktop 26.1002 marks the submission currently entering steerTurn as
+    // pending. Treating that as an older unconfirmed start rejects this very
+    // submission before Host can receive it.
+    f.hasPendingTurnStart.mockReturnValue(true);
+    f.loadMessages.mockImplementation(() => new Promise(() => undefined));
+    f.rpc.mockImplementation(async (method) => {
+      if (method === "harnessmix/thread/ownership/list") {
+        return { threads: [{ threadId: "thread", owner: "external", harnessId: "pi" }] };
+      }
+      if (method === "turn/start") return { turn: { id: "started" } };
+      throw new Error(`unexpected ${String(method)}`);
+    });
+
+    await expect(f.manager.steerTurn(...f.args)).resolves.toEqual({ turnId: "started" });
+    expect(f.hasPendingTurnStart).not.toHaveBeenCalled();
+    expect(f.loadMessages).not.toHaveBeenCalled();
+    expect(f.manager.startTurn).toHaveBeenCalledOnce();
+    expect(f.rpc.mock.calls.map(([method]) => method)).toEqual([
+      "harnessmix/thread/ownership/list",
+      "turn/start",
+    ]);
+    f.dispose();
+  });
+
+  it("bounds an active queue snapshot and clears the pending replacement for retry", async () => {
+    const f = fixture();
+    f.loadMessages.mockImplementation(() => new Promise(() => undefined));
+    vi.useFakeTimers();
+    try {
+      const first = f.manager.steerTurn(...f.args);
+      const failed = expect(first).rejects.toThrow("queue snapshot timed out");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await failed;
+      expect(f.manager.startTurn).not.toHaveBeenCalled();
+
+      f.loadMessages.mockResolvedValue(undefined);
+      await expect(f.manager.steerTurn(...f.args)).resolves.toEqual({ turnId: "replacement" });
+      expect(f.manager.startTurn).toHaveBeenCalledOnce();
+      expect(f.events.filter((event) => event === "cancel old")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
     f.dispose();
   });
 
@@ -192,6 +244,33 @@ describe("external direction changes use normal Desktop start presentation", () 
     competing[5] = "different-message";
     await expect(f.manager.steerTurn(...competing)).rejects.toThrow("already changing direction");
     waiting.resolve(undefined);
+    await expect(first).resolves.toEqual({ turnId: "replacement" });
+    await expect(duplicate).resolves.toEqual({ turnId: "replacement" });
+    expect(f.manager.startTurn).toHaveBeenCalledOnce();
+    expect(f.events.filter((event) => event === "cancel old")).toHaveLength(1);
+    f.dispose();
+  });
+
+  it("coalesces duplicate submissions that race through delayed ownership", async () => {
+    const f = fixture();
+    const ownership = Promise.withResolvers<unknown>();
+    const original = f.rpc.getMockImplementation();
+    f.rpc.mockImplementation(async (method, params, options) => {
+      if (method === "harnessmix/thread/ownership/list") return ownership.promise;
+      return original?.(method, params, options);
+    });
+
+    const first = f.manager.steerTurn(...f.args);
+    const duplicate = f.manager.steerTurn(...f.args);
+    await vi.waitFor(() => {
+      expect(
+        f.rpc.mock.calls.filter(([method]) => method === "harnessmix/thread/ownership/list"),
+      ).toHaveLength(2);
+    });
+    ownership.resolve({
+      threads: [{ threadId: "thread", owner: "external", harnessId: "pi" }],
+    });
+
     await expect(first).resolves.toEqual({ turnId: "replacement" });
     await expect(duplicate).resolves.toEqual({ turnId: "replacement" });
     expect(f.manager.startTurn).toHaveBeenCalledOnce();

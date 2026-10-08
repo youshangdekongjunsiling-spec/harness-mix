@@ -24,7 +24,6 @@ function isSteeringManager(value: unknown): value is SteeringManager {
 
 interface SubmissionHostBinding {
   getActiveTurnId(threadId: string): unknown;
-  hasPendingTurnStart(threadId: string): unknown;
 }
 
 function resolveSubmissionHost(manager: SteeringManager): SubmissionHostBinding {
@@ -33,15 +32,12 @@ function resolveSubmissionHost(manager: SteeringManager): SubmissionHostBinding 
   const host = isRecord(options) ? options.submissionHost : null;
   if (
     !isRecord(host) ||
-    typeof host.getActiveTurnId !== "function" ||
-    typeof host.hasPendingTurnStart !== "function"
+    typeof host.getActiveTurnId !== "function"
   ) {
     throw new Error("Desktop turn submission binding is unavailable");
   }
   return {
     getActiveTurnId: (threadId) => (host.getActiveTurnId as RendererMethod).call(host, threadId),
-    hasPendingTurnStart: (threadId) =>
-      (host.hasPendingTurnStart as RendererMethod).call(host, threadId),
   };
 }
 
@@ -98,6 +94,10 @@ const INTERRUPTED_QUEUE_REASON = "Interrupted before the steer was accepted.";
  * direction-change path for the 15+ seconds the desktop would otherwise spin. */
 const OWNERSHIP_RESOLUTION_TIMEOUT_MS = 15_000;
 
+/** Queue hydration is a local Desktop preflight. It must never hold the only
+ * submission promise forever when a coordinator cache is stale or rebuilding. */
+const QUEUE_SNAPSHOT_TIMEOUT_MS = 5_000;
+
 /**
  * Resolve Thread ownership for steering. Rejects when the answer does not
  * arrive in time or the Host cannot answer; callers degrade to stock steering.
@@ -142,7 +142,18 @@ async function preserveQueuedFollowUps(
   ) {
     throw new Error("Desktop follow-up queue binding is unavailable");
   }
-  await coordinator.loadMessages.call(coordinator, threadId);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.resolve(coordinator.loadMessages.call(coordinator, threadId)),
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("Desktop follow-up queue snapshot timed out")),
+        QUEUE_SNAPSHOT_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
   const messages: unknown = coordinator.readMessages.call(coordinator, threadId);
   if (!Array.isArray(messages)) throw new Error("Desktop follow-up queue is unavailable");
   const pausedBeforeUs = new Set(
@@ -267,16 +278,20 @@ export function installRendererExternalSteering(target: unknown): (() => void) |
             restoreMessage.id
           ? restoreMessage.id
           : null;
-    const existing = pendingReplacements.get(threadId);
-    if (existing) {
+    const submissionFingerprint = JSON.stringify(input);
+    const pendingReplacement = (): Promise<unknown> | null => {
+      const existing = pendingReplacements.get(threadId);
+      if (!existing) return null;
       if (
         existing.messageId === duplicateMessageId &&
-        existing.fingerprint === JSON.stringify(input)
+        existing.fingerprint === submissionFingerprint
       ) {
         return existing.promise;
       }
       throw new Error("This Thread is already changing direction");
-    }
+    };
+    const existing = pendingReplacement();
+    if (existing) return existing;
     let host: ReturnType<typeof resolveSubmissionHost> | null = null;
     let expectedTurnId: unknown;
     try {
@@ -328,13 +343,15 @@ export function installRendererExternalSteering(target: unknown): (() => void) |
         : typeof restoreMessage.id === "string" && restoreMessage.id
           ? restoreMessage.id
           : crypto.randomUUID();
-    const fingerprint = JSON.stringify(input);
+    const fingerprint = submissionFingerprint;
     if (expectedTurnId != null && (typeof expectedTurnId !== "string" || !expectedTurnId)) {
       throw new Error("Desktop active Turn identity is invalid");
     }
-    if (expectedTurnId == null && host.hasPendingTurnStart(threadId)) {
-      throw new Error("Previous Turn submission has not been confirmed yet");
-    }
+    // Two submissions can both enter before either ownership lookup resolves.
+    // Re-check synchronously after the last await and before registering this
+    // replacement so only one reaches Desktop start presentation and Host.
+    const raced = pendingReplacement();
+    if (raced) return raced;
     const context = restoreMessage.context;
     const routeKey = `${threadId}\u0000${messageId}`;
     if (typeof expectedTurnId === "string") {
@@ -343,7 +360,12 @@ export function installRendererExternalSteering(target: unknown): (() => void) |
     const promise = Promise.resolve()
       .then(async () => {
         if (disposed) throw new Error("External steering binding was disposed");
-        const resumeQueue = await preserveQueuedFollowUps(manager, threadId);
+        // An idle follow-up cannot have queue entries paused by cancellation,
+        // so avoid Desktop's queue hydration entirely. This also keeps a stale
+        // local coordinator cache from delaying an otherwise ordinary start.
+        const resumeQueue = typeof expectedTurnId === "string"
+          ? await preserveQueuedFollowUps(manager, threadId)
+          : () => undefined;
         try {
           if (disposed) throw new Error("External steering binding was disposed");
           const response = await manager.startTurn(
