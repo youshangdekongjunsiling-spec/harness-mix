@@ -38,8 +38,21 @@ function userContent(content) {
 function selectClaudeBranch(entries) {
   const rows = (entries ?? []).filter(row => row && ['user', 'assistant', 'system', 'attachment'].includes(row.type) && typeof row.uuid === 'string');
   const byId = new Map(rows.map(row => [row.uuid, { ...row }]));
+  const order = new Map(rows.map((row, index) => [row.uuid, index]));
   for (const row of byId.values()) {
     if (row.type !== 'system' || row.subtype !== 'compact_boundary') continue;
+    // Claude starts a fresh physical parent chain after compaction, while
+    // logicalParentUuid retains the append-only conversation edge. Prefer that
+    // edge when the pre-compact row is still present in the JSONL. The
+    // preserved-window metadata below is only a fallback for partial exports;
+    // applying both would reparent old rows into a cycle and duplicate history.
+    const logicalParent = row.logicalParentUuid ? byId.get(row.logicalParentUuid) : null;
+    const sameSession = logicalParent && (logicalParent.sessionId ?? logicalParent.session_id)
+      === (row.sessionId ?? row.session_id);
+    if (logicalParent && sameSession && order.get(logicalParent.uuid) < order.get(row.uuid)) {
+      byId.set(row.uuid, { ...row, parentUuid: logicalParent.uuid });
+      continue;
+    }
     const preserved = row.compactMetadata?.preservedMessages;
     const segment = row.compactMetadata?.preservedSegment;
     if (preserved?.uuids?.length && preserved.uuids.every(id => byId.has(id))) {
@@ -52,7 +65,6 @@ function selectClaudeBranch(entries) {
       for (const [id, value] of byId) if (value.parentUuid === segment.anchorUuid && id !== segment.headUuid) byId.set(id, { ...value, parentUuid: segment.tailUuid });
     }
   }
-  const order = new Map(rows.map((row, index) => [row.uuid, index]));
   const parents = new Set([...byId.values()].map(row => row.parentUuid).filter(Boolean));
   const candidates = [];
   for (const leaf of [...byId.values()].filter(row => !parents.has(row.uuid))) {
@@ -103,7 +115,8 @@ function selectClaudeBranch(entries) {
     if (extra.length) additions.set(assistantByMessage.get(messageId).uuid, extra);
   }
   const expanded = chain.flatMap(row => [row, ...(additions.get(row.uuid) ?? [])]);
-  return expanded.filter(row => ['user', 'assistant'].includes(row.type) && !row.isSidechain && !row.teamName && !row.isMeta)
+  return expanded.filter(row => ['user', 'assistant'].includes(row.type) && !row.isSidechain && !row.teamName
+    && !row.isMeta && !row.isCompactSummary)
     .map(row => ({ ...row, session_id: row.sessionId, parent_tool_use_id: null }));
 }
 

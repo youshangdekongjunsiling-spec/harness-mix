@@ -29,7 +29,16 @@ function createClaudeHistorySyncOptions() {
       thread.updatedAt = Math.max(...timestamps);
       const execution = new CoreSession();
       execution.threadCreated(thread);
-      return { messages: thread.messages, checkpoint: execution.checkpoint(thread), updatedAt: thread.updatedAt,
+      const checkpoint = execution.checkpoint(thread);
+      // Context usage is a Host-derived thread item, not a Claude transcript
+      // event. Keep it across source reprojection so the runtime's removal
+      // guard does not reject a valid append after a usage refresh.
+      const detachedUsage = (target.checkpoint?.items ?? [])
+        .filter(item => item?.type === 'usage' && item.turnId == null);
+      const itemIds = new Set(checkpoint.items.map(item => item.id));
+      for (const item of detachedUsage) if (!itemIds.has(item.id)) checkpoint.items.push(structuredClone(item));
+      if (target.checkpoint?.thread?.usage) checkpoint.thread.usage = structuredClone(target.checkpoint.thread.usage);
+      return { messages: thread.messages, checkpoint, updatedAt: thread.updatedAt,
         nativeHistorySnapshot: { version: 1, source: 'claude', nativeSessionId: thread.nativeSessionId,
           capturedAt: new Date().toISOString(), sourceMessageCount: snapshot.branchRows.length,
           sourceCompleteBytes: snapshot.completeBytes } };

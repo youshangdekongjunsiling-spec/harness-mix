@@ -28,8 +28,12 @@ function hashBytes(buffer, count = buffer.length) {
 
 function checkpointFingerprint(checkpoint) {
   if (!checkpoint) return null;
+  // Thread-level usage is refreshed independently of conversation history.
+  // Exclude that derived item so a context-meter update cannot look like a
+  // user edit and pause an otherwise append-only Claude sync.
+  const items = (checkpoint.items ?? []).filter(item => !(item?.type === 'usage' && item.turnId == null));
   return crypto.createHash('sha256').update(JSON.stringify({ turns: checkpoint.turns ?? [],
-    items: checkpoint.items ?? [] })).digest('hex');
+    items })).digest('hex');
 }
 
 function branchChain(rows) {

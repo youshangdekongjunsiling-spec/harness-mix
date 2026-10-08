@@ -49,6 +49,9 @@ function candidate(threadId, rows) {
 class FakeRuntime {
   constructor(file, initial) {
     this.threadId = 'thread-1';
+    this.thread = { id: this.threadId, cwd: 'C:\\fixture', harnessId: 'claude',
+      nativeSessionId: 'fixture-session', title: 'fixture', createdAt: 1, updatedAt: 1,
+      messages: [], tools: [], pendingApprovals: [] };
     this.source = { threadId: this.threadId, harnessId: 'claude', sourceFile: file, enabled: true,
       paused: false, status: 'synced', cursor: {} };
     this.target = initial;
@@ -58,7 +61,7 @@ class FakeRuntime {
   }
   listClaudeHistorySyncSources() { return [{ ...this.source, cursor: { ...this.source.cursor } }]; }
   isClaudeHistorySyncBusy() { return this.busy; }
-  prepareClaudeHistorySync() { return { thread: { id: this.threadId }, checkpoint: this.target.checkpoint }; }
+  prepareClaudeHistorySync() { return { thread: this.thread, checkpoint: this.target.checkpoint }; }
   async updateClaudeHistorySyncStatus(_id, patch) {
     this.source = { ...this.source, ...patch };
     if (patch.cursor) this.source.cursor = { ...patch.cursor };
@@ -178,6 +181,21 @@ async function testFingerprintRoundTripAndStop() {
   const execution = new CoreSession();
   execution.threadCreated(reloadedThread);
   assert.equal(checkpointFingerprint(execution.checkpoint(reloadedThread)), checkpointFingerprint(projected.checkpoint));
+  const withDetachedUsage = structuredClone(projected.checkpoint);
+  withDetachedUsage.items.push({ id: 'usage-thread-1', type: 'usage', turnId: null,
+    status: 'completed', usage: { inputTokens: 1 } });
+  assert.equal(checkpointFingerprint(withDetachedUsage), checkpointFingerprint(projected.checkpoint),
+    'thread-level derived usage must not invalidate the history target fingerprint');
+  withDetachedUsage.items[withDetachedUsage.items.length - 1].usage.inputTokens = 2;
+  assert.equal(checkpointFingerprint(withDetachedUsage), checkpointFingerprint(projected.checkpoint),
+    'updates to thread-level derived usage must not invalidate the history target fingerprint');
+  for (const type of ['user_message', 'agent_message', 'tool_call', 'usage']) {
+    const withTurnItem = structuredClone(projected.checkpoint);
+    withTurnItem.items.push({ id: `changed-${type}`, type, turnId: withTurnItem.turns[0].id,
+      status: 'completed' });
+    assert.notEqual(checkpointFingerprint(withTurnItem), checkpointFingerprint(projected.checkpoint),
+      `${type} attached to a turn must remain part of conflict detection`);
+  }
 
   let stats = 0;
   const runtime = { listClaudeHistorySyncSources: () => [], announceClaudeHistorySyncStatus() {} };
@@ -195,13 +213,76 @@ async function testProductionProjectionIsDeterministic() {
   const options = createClaudeHistorySyncOptions();
   const target = { thread: { id: 'thread-1', cwd: 'C:\\fixture', harnessId: 'claude',
     nativeSessionId: 'fixture-session', title: 'fixture', createdAt: 1, updatedAt: 1,
-    messages: [], tools: [], pendingApprovals: [], usage: {} } };
+    messages: [], tools: [], pendingApprovals: [], usage: {} }, checkpoint: {
+      thread: { usage: { inputTokens: 1, contextWindow: 100 } }, items: [
+      { id: 'usage-thread-1', type: 'usage', turnId: null, status: 'completed', usage: { inputTokens: 1 } },
+    ] } };
   const snapshot = options.readSnapshot({ rows, target, completeBytes: encode(rows).length });
   const first = options.applySnapshot({ snapshot, target });
   const second = options.applySnapshot({ snapshot, target });
   assert.equal(checkpointFingerprint(first.checkpoint), checkpointFingerprint(second.checkpoint));
   assert.equal(first.nativeHistorySnapshot.sourceMessageCount, 2);
   assert.equal(first.checkpoint.turns.length, 1);
+  assert.equal(first.checkpoint.items.filter(item => item.type === 'usage').length, 1,
+    'source reprojection must retain detached Host usage');
+  assert.deepEqual(first.checkpoint.thread.usage, target.checkpoint.thread.usage,
+    'source reprojection must retain the current thread usage summary');
+}
+
+async function testCompactionBridgeAndFollowingAppend() {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'hm-claude-compact-sync-'));
+  const file = path.join(directory, 'session.jsonl');
+  const before = [row('user', 'cu1', null, 'before compact'), row('assistant', 'ca1', 'cu1', 'before answer')];
+  await fs.writeFile(file, encode(before));
+  const options = createClaudeHistorySyncOptions();
+  const target = { thread: { id: 'thread-1', cwd: 'C:\\fixture', harnessId: 'claude',
+    nativeSessionId: 'fixture-session', title: 'fixture', createdAt: 1, updatedAt: 1,
+    messages: [], tools: [], pendingApprovals: [] } };
+  const initialSnapshot = options.readSnapshot({ rows: before, target, completeBytes: encode(before).length });
+  const initial = options.applySnapshot({ snapshot: initialSnapshot, target });
+  const runtime = new FakeRuntime(file, initial);
+  const stat = await fs.stat(file);
+  const initialChain = branchChain(initialSnapshot.branchRows);
+  runtime.source.cursor = { observedSize: stat.size, observedMtimeMs: stat.mtimeMs,
+    appliedSize: encode(before).length, sourcePrefixHash: hashBytes(encode(before)),
+    branchCount: initialChain.length, prefixHash: hashPrefix(initialChain),
+    leafUuid: initialSnapshot.branchRows.at(-1).uuid, targetFingerprint: checkpointFingerprint(initial.checkpoint) };
+  const sync = new ClaudeHistorySync({ runtime, intervalMs: 60_000, ...options });
+  sync.start(); await sync.tick();
+
+  const compactAppend = [
+    { type: 'system', subtype: 'compact_boundary', uuid: 'compact-1', parentUuid: null,
+      logicalParentUuid: 'ca1', sessionId: 'fixture-session', timestamp: '2026-10-08T11:01:00.000Z',
+      compactMetadata: { preservedMessages: { anchorUuid: 'cu1', uuids: ['ca1'] } } },
+    { type: 'user', uuid: 'summary-1', parentUuid: 'compact-1', sessionId: 'fixture-session',
+      timestamp: '2026-10-08T11:01:01.000Z', isCompactSummary: true,
+      message: { role: 'user', content: 'synthetic summary' } },
+    { type: 'assistant', uuid: 'continued-1', parentUuid: 'summary-1', sessionId: 'fixture-session',
+      timestamp: '2026-10-08T11:01:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'continued context' }] } },
+    row('user', 'cu2', 'continued-1', 'after compact'), row('assistant', 'ca2', 'cu2', 'after answer'),
+  ];
+  await append(file, compactAppend); await sync.tick();
+  assert.equal(runtime.applyCount, 1);
+  assert.equal(runtime.source.paused, false);
+  assert.equal(runtime.target.checkpoint.turns.length, 2);
+
+  await append(file, [row('user', 'cu3', 'ca2', 'later prompt'), row('assistant', 'ca3', 'cu3', 'later answer')]);
+  await sync.tick();
+  assert.equal(runtime.applyCount, 2, 'a normal append after compaction must continue syncing');
+  assert.equal(runtime.target.checkpoint.turns.length, 3);
+
+  await append(file, [
+    { type: 'system', subtype: 'compact_boundary', uuid: 'compact-2', parentUuid: null,
+      logicalParentUuid: 'ca3', sessionId: 'fixture-session', timestamp: '2026-10-08T11:03:00.000Z' },
+    { type: 'user', uuid: 'summary-2', parentUuid: 'compact-2', sessionId: 'fixture-session',
+      timestamp: '2026-10-08T11:03:01.000Z', isCompactSummary: true,
+      message: { role: 'user', content: 'second synthetic summary' } },
+    row('user', 'cu4', 'summary-2', 'after second compact'), row('assistant', 'ca4', 'cu4', 'fourth answer'),
+  ]);
+  await sync.tick();
+  assert.equal(runtime.applyCount, 3, 'a second compact boundary must preserve the synchronized prefix');
+  assert.equal(runtime.target.checkpoint.turns.length, 4);
+  await sync.stop(); await fs.rm(directory, { recursive: true, force: true });
 }
 
 Promise.resolve()
@@ -209,5 +290,6 @@ Promise.resolve()
   .then(testRewriteBranchTruncateBusyAndHostConflict)
   .then(testFingerprintRoundTripAndStop)
   .then(testProductionProjectionIsDeterministic)
+  .then(testCompactionBridgeAndFollowingAppend)
   .then(() => console.log('claude history sync tests passed'))
   .catch(error => { console.error(error.stack || error.message); process.exitCode = 1; });
