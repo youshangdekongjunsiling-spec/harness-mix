@@ -1039,7 +1039,7 @@ class HostRuntime {
     if (thread.workspace?.mode === 'worktree') {
       await removeWorkspace(thread.workspace).catch(() => {});
     }
-    await this.store.markRemoved(threadId);
+    await this.store.markRemoved(threadId, { harnessId: thread.harnessId, nativeSessionId: thread.nativeSessionId });
     this.threads = this.threads.filter((t) => t.id !== threadId);
     await this.collaboration.forgetThread(threadId).catch(() => {});
     await this.#save();
@@ -1292,13 +1292,28 @@ class HostRuntime {
   }
 
   async importNativeSession(candidate) {
-    const existing = this.threads.find(t => t.harnessId === candidate.harnessId && t.nativeSessionId === candidate.nativeSessionId);
+    const locate = () => this.threads.find(t => t.harnessId === candidate.harnessId
+      && t.nativeSessionId === candidate.nativeSessionId);
+    const existing = locate();
     if (existing) return existing;
+    if (candidate.id && this.threads.some(thread => thread.id === candidate.id)) {
+      throw new Error('Imported native session thread identity is already in use');
+    }
     await this.#assertCwd(candidate.cwd);
-    const thread = { id: randomUUID(), harnessId: candidate.harnessId, nativeSessionId: candidate.nativeSessionId,
-      nativeSessionFile: candidate.nativeSessionFile, title: candidate.title || '导入的原生会话', cwd: candidate.cwd,
-      createdAt: candidate.updatedAt, updatedAt: candidate.updatedAt, status: 'ready', connectionStatus: 'ready',
-      restore: true, options: {}, messages: candidate.messages || [], tools: [], pendingApprovals: [],
+    const raced = locate();
+    if (raced) return raced;
+    if (candidate.id && this.threads.some(thread => thread.id === candidate.id)) {
+      throw new Error('Imported native session thread identity became occupied');
+    }
+    const thread = { id: candidate.id || randomUUID(), harnessId: candidate.harnessId,
+      nativeSessionId: candidate.nativeSessionId, nativeSessionFile: candidate.nativeSessionFile,
+      title: candidate.title || '导入的原生会话', cwd: candidate.cwd,
+      createdAt: candidate.createdAt ?? candidate.updatedAt, updatedAt: candidate.updatedAt,
+      status: 'ready', connectionStatus: 'ready', restore: true, options: {},
+      messages: candidate.messages || [], tools: [], pendingApprovals: [],
+      ...(candidate.coreState ? { coreState: structuredClone(candidate.coreState) } : {}),
+      ...(candidate.nativeHistorySnapshot ? { nativeHistorySnapshot: structuredClone(candidate.nativeHistorySnapshot) } : {}),
+      ...(candidate.nativeHistorySync ? { nativeHistorySync: structuredClone(candidate.nativeHistorySync) } : {}),
       ...(candidate.parentThreadId ? { parentThreadId: candidate.parentThreadId } : {}),
       ...(candidate.nativeReadOnly ? { nativeReadOnly: true } : {}) };
     this.threads.unshift(thread);
@@ -1307,6 +1322,25 @@ class HostRuntime {
     for (const listener of this.listeners) listener({ type: 'thread-created', thread });
     this.#broadcast();
     return thread;
+  }
+
+  listImportedNativeSessions() {
+    return this.threads.flatMap(thread => typeof thread.harnessId === 'string'
+      && typeof thread.nativeSessionId === 'string'
+      ? [{ harnessId: thread.harnessId, nativeSessionId: thread.nativeSessionId }] : []);
+  }
+
+  async importDiscoveredHistorySource(candidate) {
+    if (!candidate || typeof candidate.id !== 'string' || typeof candidate.harnessId !== 'string'
+      || typeof candidate.nativeSessionId !== 'string' || !candidate.nativeHistorySync?.enabled) {
+      throw new Error('Invalid discovered history source');
+    }
+    const existing = this.threads.find(thread => thread.harnessId === candidate.harnessId
+      && thread.nativeSessionId === candidate.nativeSessionId);
+    if (existing) return existing;
+    if (await this.store.wasRemoved({ threadId: candidate.id, harnessId: candidate.harnessId,
+      nativeSessionId: candidate.nativeSessionId })) return null;
+    return this.importNativeSession(candidate);
   }
 
   /** Explicitly enabled, already-imported Claude sources eligible for one-way append sync. */

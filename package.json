@@ -190,7 +190,7 @@
     "test:team-template": "node scripts/team-template-test.cjs",
     "test:insights": "node scripts/insights-test.cjs",
     "test:team-mailbox": "node scripts/team-mailbox-test.cjs",
-    "test:claude-history": "node scripts/claude-history-import-test.cjs && node scripts/claude-history-sync-test.cjs && node scripts/history-repair-migration-test.cjs && node scripts/native-history-sync-notifications-test.cjs"
+    "test:claude-history": "node scripts/claude-history-import-test.cjs && node scripts/claude-history-sync-test.cjs && node scripts/claude-history-discovery-test.cjs && node scripts/history-repair-migration-test.cjs && node scripts/native-history-sync-notifications-test.cjs"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

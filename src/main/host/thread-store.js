@@ -98,10 +98,31 @@ class ThreadStore {
     recovered.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
     return recovered;
   }
-  async markRemoved(threadId) {
+  async markRemoved(threadId, nativeIdentity = null) {
     // Persist intent before removing the index entry. If the process exits
     // between index commit and record unlink, startup must not revive it.
-    await writeAtomic(path.join(this.deletedDirectory, recordName(threadId)), { id: threadId, deletedAt: Date.now() });
+    const identity = nativeIdentity && typeof nativeIdentity.harnessId === 'string'
+      && typeof nativeIdentity.nativeSessionId === 'string'
+      ? { harnessId: nativeIdentity.harnessId, nativeSessionId: nativeIdentity.nativeSessionId } : undefined;
+    await writeAtomic(path.join(this.deletedDirectory, recordName(threadId)),
+      { id: threadId, deletedAt: Date.now(), ...(identity ? { nativeIdentity: identity } : {}) });
+  }
+  async wasRemoved({ threadId, harnessId, nativeSessionId }) {
+    if (typeof threadId === 'string' && fsSync.existsSync(path.join(this.deletedDirectory, recordName(threadId)))) return true;
+    if (typeof harnessId !== 'string' || typeof nativeSessionId !== 'string') return false;
+    const entries = await fs.readdir(this.deletedDirectory, { withFileTypes: true }).catch(error => {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const marker = JSON.parse(await fs.readFile(path.join(this.deletedDirectory, entry.name), 'utf8'));
+        if (marker?.nativeIdentity?.harnessId === harnessId
+          && marker.nativeIdentity.nativeSessionId === nativeSessionId) return true;
+      } catch { /* malformed legacy markers do not block unrelated imports */ }
+    }
+    return false;
   }
   async load() {
     const index = await this.#readIndex();

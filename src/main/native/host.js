@@ -41,7 +41,10 @@ async function runNativeHost() {
     const repair = require('./pending-history-repair').applyPendingHistoryRepair(directory);
     if (repair.status !== 'none') traffic('history-repair', repair);
   } catch (error) { traffic('history-repair-skipped', { message: error.message }); }
-  const runtime = new HostRuntime({ dataDirectory: directory, claudeHistorySync: require('./claude-sync-options').createClaudeHistorySyncOptions() });
+  const claudeHistorySync = require('./claude-sync-options').createClaudeHistorySyncOptions();
+  const discoverSources = require('./claude-history-discovery').createClaudeHistoryDiscovery();
+  if (discoverSources) claudeHistorySync.discoverSources = discoverSources;
+  const runtime = new HostRuntime({ dataDirectory: directory, claudeHistorySync });
   // Heartbeat: lets the launcher tell a live instance from leftovers, and gives
   // crash recovery a timestamp to reason about.
   const startedAt = Date.now();

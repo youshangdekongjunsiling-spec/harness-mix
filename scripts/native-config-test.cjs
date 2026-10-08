@@ -7,15 +7,22 @@ const { isCodexTaskEnvironment, readLiveHostInstance } = require('../src/main/na
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-mix-config-'));
 try {
-  const source = { HARNESSMIX_DATA_DIR: directory, HARNESSMIX_PI_COMMAND: 'C:\\Native tools\\pi.cmd', PRIVATE_TEST_VALUE: 'do-not-persist' };
+  const source = { HARNESSMIX_DATA_DIR: directory, HARNESSMIX_PI_COMMAND: 'C:\Native tools\pi.cmd',
+    HARNESSMIX_CLAUDE_HISTORY_DISCOVERY: '1', PRIVATE_TEST_VALUE: 'do-not-persist' };
   const env = nativeEnvironment(source);
   assert.equal(source.HARNESSMIX_DEFAULT_AGENT, undefined, 'Input environment is not mutated');
   assert.equal(env.HARNESSMIX_DEFAULT_AGENT, 'codex');
   saveNativeSettings(env);
   const saved = JSON.parse(fs.readFileSync(path.join(directory, 'harness-mix-settings.json'), 'utf8'));
-  assert.deepEqual(saved, { HARNESSMIX_PI_COMMAND: source.HARNESSMIX_PI_COMMAND });
+  assert.deepEqual(saved, { HARNESSMIX_PI_COMMAND: source.HARNESSMIX_PI_COMMAND,
+    HARNESSMIX_CLAUDE_HISTORY_DISCOVERY: true });
   assert.equal(nativeEnvironment({ HARNESSMIX_DATA_DIR: directory }).HARNESSMIX_PI_COMMAND, source.HARNESSMIX_PI_COMMAND,
     'AppX child recovers command settings from the data directory');
+  assert.equal(nativeEnvironment({ HARNESSMIX_DATA_DIR: directory }).HARNESSMIX_CLAUDE_HISTORY_DISCOVERY, '1',
+    'AppX child recovers the allowlisted discovery opt-in');
+  assert.equal(nativeEnvironment({ HARNESSMIX_DATA_DIR: directory,
+    HARNESSMIX_CLAUDE_HISTORY_DISCOVERY: '0' }).HARNESSMIX_CLAUDE_HISTORY_DISCOVERY, '0',
+    'an explicit discovery opt-out overrides saved settings');
   assert.equal(nativeEnvironment({ HARNESSMIX_DATA_DIR: directory, HARNESSMIX_PI_COMMAND: 'D:\\other\\pi.cmd' }).HARNESSMIX_PI_COMMAND,
     'D:\\other\\pi.cmd', 'Explicit environment takes priority');
   for (const file of Object.values(nativePaths())) assert.ok(fs.statSync(file).isFile(), file);

@@ -2,7 +2,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { dataDirectory, executableName } = require('./platform');
 const root = path.resolve(__dirname, '../../..');
-const settingKeys = ['HARNESS_MIX_DSH_ROOT', 'HARNESSMIX_PI_COMMAND', 'HARNESSMIX_CLAUDE_COMMAND', 'HARNESSMIX_DEEPSEEK_HARNESS_COMMAND', 'HARNESSMIX_ANTIGRAVITY_COMMAND', 'HARNESS_MIX_CODEBUDDY_EXECUTABLE', 'HARNESS_MIX_WORKBUDDY_EXECUTABLE', 'HARNESS_MIX_KIRO_EXECUTABLE', 'HARNESS_MIX_CURSOR_EXECUTABLE', 'HARNESS_MIX_QODER_EXECUTABLE', 'HARNESS_MIX_ZCODE_EXECUTABLE', 'HARNESS_MIX_TRAE_EXECUTABLE'];
+const pathSettingKeys = ['HARNESS_MIX_DSH_ROOT', 'HARNESSMIX_PI_COMMAND', 'HARNESSMIX_CLAUDE_COMMAND', 'HARNESSMIX_DEEPSEEK_HARNESS_COMMAND', 'HARNESSMIX_ANTIGRAVITY_COMMAND', 'HARNESS_MIX_CODEBUDDY_EXECUTABLE', 'HARNESS_MIX_WORKBUDDY_EXECUTABLE', 'HARNESS_MIX_KIRO_EXECUTABLE', 'HARNESS_MIX_CURSOR_EXECUTABLE', 'HARNESS_MIX_QODER_EXECUTABLE', 'HARNESS_MIX_ZCODE_EXECUTABLE', 'HARNESS_MIX_TRAE_EXECUTABLE'];
+const booleanSettingKeys = ['HARNESSMIX_CLAUDE_HISTORY_DISCOVERY'];
 
 function nativePaths(platform = process.platform) {
   const build = path.join(root, 'output/native-build');
@@ -26,8 +27,11 @@ function nativeEnvironment(environment = process.env) {
   const settingsPath = path.join(env.HARNESSMIX_DATA_DIR, 'harness-mix-settings.json');
   if (fs.existsSync(settingsPath)) {
     const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    for (const key of settingKeys) {
+    for (const key of pathSettingKeys) {
       if (!env[key] && typeof saved[key] === 'string') env[key] = saved[key];
+    }
+    for (const key of booleanSettingKeys) {
+      if (env[key] == null && typeof saved[key] === 'boolean') env[key] = saved[key] ? '1' : '0';
     }
   }
   env.HARNESSMIX_DEFAULT_AGENT ||= 'codex';
@@ -43,10 +47,11 @@ function nativeEnvironment(environment = process.env) {
 
 function saveNativeSettings(env) {
   fs.mkdirSync(env.HARNESSMIX_DATA_DIR, { recursive: true });
-  // Only executable locations are persisted; never copy the complete environment.
-  const settings = Object.fromEntries(settingKeys.filter(key => env[key] &&
+  // Persist only allowlisted executable locations and feature booleans; never copy the complete environment.
+  const settings = Object.fromEntries(pathSettingKeys.filter(key => env[key] &&
     !(key === 'HARNESSMIX_DEEPSEEK_HARNESS_COMMAND' && env[key] === path.join(root, 'scripts', 'dsh-native.cmd')))
     .map(key => [key, env[key]]));
+  for (const key of booleanSettingKeys) if (env[key] != null) settings[key] = env[key] === '1';
   const file = path.join(env.HARNESSMIX_DATA_DIR, 'harness-mix-settings.json');
   fs.writeFileSync(`${file}.tmp`, JSON.stringify(settings, null, 2));
   fs.renameSync(`${file}.tmp`, file);

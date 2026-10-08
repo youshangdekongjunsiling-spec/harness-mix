@@ -1,6 +1,14 @@
 # Claude history synchronization
 
-Harness Mix can follow an imported Claude Code JSONL session as an explicitly enabled, one-way history source. The Host polls enabled sources every five seconds and projects newly completed source records into the existing imported thread. It never writes to the Claude file, starts Claude Code, or recursively discovers other sessions.
+Harness Mix can follow an imported Claude Code JSONL session as an explicitly enabled, one-way history source. The Host polls enabled sources every five seconds and projects newly completed source records into the existing imported thread. It never writes to the Claude file or starts Claude Code. By default it does not discover sessions automatically; the global opt-in described below adds shallow local discovery.
+
+## Optional automatic discovery
+
+Set **HARNESSMIX_CLAUDE_HISTORY_DISCOVERY=1**, or save the corresponding boolean setting as true, to scan direct JSONL files below Claude's local projects directories at startup and about every 30 seconds. The scan reads directory entries and file metadata first. It reads a transcript only when its native session identity is not already imported and caches unchanged invalid candidates by size and modification time.
+
+Automatic discovery skips empty files, partial JSONL tails, nested subagent files, sidechain-only histories, mixed session identities, missing working directories, and conversations that do not yet contain both a real user input and an assistant record. A file that grows or changes is reconsidered. Imported threads use the same projector, append-only cursor checks, persistence, and sidebar notification path as manual imports.
+
+Native session identity prevents duplicate import across scans and restarts. Archived threads remain managed and are not recreated. Deletion writes a native identity tombstone so a deleted automatically or manually imported session stays deleted. Legacy deletion markers created before native identities were recorded can only suppress the original Host thread ID.
 
 ## Runtime integration
 

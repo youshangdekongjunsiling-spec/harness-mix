@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const DEFAULT_INTERVAL_MS = 5_000;
+const DEFAULT_DISCOVERY_INTERVAL_MS = 30_000;
 
 function isEligibleClaudeHistorySyncThread(thread) {
   return thread?.harnessId === 'claude' && thread.nativeHistorySnapshot?.source === 'claude'
@@ -64,7 +65,8 @@ function parseCompleteJsonl(buffer) {
 }
 
 class ClaudeHistorySync {
-  constructor({ runtime, readSnapshot, applySnapshot, onStatus = null, intervalMs = DEFAULT_INTERVAL_MS,
+  constructor({ runtime, readSnapshot, applySnapshot, discoverSources = null,
+    onStatus = null, intervalMs = DEFAULT_INTERVAL_MS, discoveryIntervalMs = DEFAULT_DISCOVERY_INTERVAL_MS,
     stat = fs.stat, readFile = fs.readFile } = {}) {
     if (!runtime) throw new TypeError('runtime is required');
     if (typeof readSnapshot !== 'function') throw new TypeError('readSnapshot is required');
@@ -72,8 +74,11 @@ class ClaudeHistorySync {
     this.runtime = runtime;
     this.readSnapshot = readSnapshot;
     this.applySnapshot = applySnapshot;
+    this.discoverSources = typeof discoverSources === 'function' ? discoverSources : null;
     this.onStatus = onStatus;
     this.intervalMs = intervalMs;
+    this.discoveryIntervalMs = discoveryIntervalMs;
+    this.nextDiscoveryAt = 0;
     this.stat = stat;
     this.readFile = readFile;
     this.timer = null;
@@ -107,6 +112,7 @@ class ClaudeHistorySync {
   }
 
   async #poll() {
+    await this.#discover();
     const sources = this.runtime.listClaudeHistorySyncSources();
     for (const source of sources) {
       if (this.stopped) break;
@@ -116,6 +122,22 @@ class ClaudeHistorySync {
         }
         return this.#status(source, 'error', error.message, { reason: error.code || 'sync-error' });
       });
+    }
+  }
+
+  async #discover() {
+    if (!this.discoverSources || Date.now() < this.nextDiscoveryAt) return;
+    this.nextDiscoveryAt = Date.now() + this.discoveryIntervalMs;
+    try {
+      const knownNativeSessions = this.runtime.listImportedNativeSessions?.() ?? [];
+      const candidates = await this.discoverSources({ knownNativeSessions });
+      for (const candidate of candidates ?? []) {
+        if (this.stopped) break;
+        await this.runtime.importDiscoveredHistorySource(candidate).catch(() => {});
+      }
+    } catch {
+      // Discovery is best-effort and retries on the next discovery interval.
+      // Existing explicitly enabled sync sources must continue polling.
     }
   }
 
@@ -198,5 +220,5 @@ class ClaudeHistorySync {
   }
 }
 
-module.exports = { ClaudeHistorySync, DEFAULT_INTERVAL_MS, branchChain, checkpointFingerprint, hashBytes,
+module.exports = { ClaudeHistorySync, DEFAULT_DISCOVERY_INTERVAL_MS, DEFAULT_INTERVAL_MS, branchChain, checkpointFingerprint, hashBytes,
   hashPrefix, isEligibleClaudeHistorySyncThread, parseCompleteJsonl };
