@@ -85,6 +85,12 @@ Shim 只接管作为 Desktop 协议端点的普通 `app-server`。`app-server pr
 - `HARNESS_MIX_CODEBUDDY_EXECUTABLE`、`HARNESS_MIX_KIRO_EXECUTABLE`、`HARNESS_MIX_CURSOR_EXECUTABLE`：可选原生 CLI 路径。CodeBuddy 兼容旧的 `HARNESS_MIX_WORKBUDDY_EXECUTABLE`，新变量优先。接口与验收见 [原生 ACP 深度适配](native-acp.md)。
 - `HARNESSMIX_PI_COMMAND`、`HARNESSMIX_CLAUDE_COMMAND`、`HARNESSMIX_DEEPSEEK_HARNESS_COMMAND`、`HARNESSMIX_ANTIGRAVITY_COMMAND`：可选原生命令路径。
 
+Claude Adapter 的健康检查与 Agent SDK 会话共用同一次可执行文件解析。未设置
+`HARNESSMIX_CLAUDE_COMMAND` 时，两者都使用 Agent SDK 内置的 Claude Code；Windows
+上的标准 npm `claude.cmd` / `.bat` shim 会解析到其实际 `.js` 或 `.exe` 目标后交给
+SDK。兼容变量 `HARNESS_MIX_CLAUDE_EXECUTABLE` 仍受支持；如果两个变量同时存在，
+该兼容变量优先，以保留现有显式进程环境覆盖原生设置文件的行为。
+
 环境变量优先于该文件；删除文件中的对应字段即可恢复默认。账号认证使用各原生程序和上游配置机制，本项目不保存凭据。
 
 DSH Web Remote 与协作 ACP 默认使用 `HARNESS_MIX_DSH_ROOT`（未设置时为

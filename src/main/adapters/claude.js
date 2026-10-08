@@ -1,6 +1,7 @@
+const fs = require("node:fs");
+const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
-const { cliSpawn } = require("../host/jsonl");
 const { recordNative } = require("../harness-adapter/fixture-recorder");
 
 const manifest = {
@@ -262,6 +263,48 @@ async function loadSdk() {
   return import("@anthropic-ai/claude-agent-sdk");
 }
 
+function resolveCmdShim(command) {
+  if (!/\.(?:cmd|bat)$/i.test(command)) return command;
+  let contents;
+  try { contents = fs.readFileSync(command, 'utf8'); }
+  catch (error) { throw new Error(`无法读取 Claude 命令包装器 ${command}: ${error.message}`); }
+  const target = contents.match(/["']%dp0%[\\/]([^"'\r\n]+?\.(?:exe|[cm]?js))["']\s+%\*/i)?.[1];
+  if (!target) {
+    throw new Error(`Claude 命令包装器 ${command} 不是受支持的 npm .cmd/.bat shim`);
+  }
+  const resolved = path.resolve(path.dirname(command), target.replace(/[\\/]/g, path.sep));
+  if (!fs.existsSync(resolved)) throw new Error(`Claude 命令包装器目标不存在: ${resolved}`);
+  return resolved;
+}
+
+/** inspect() 与 SDK query() 共用的唯一 Claude Code 可执行文件选择。 */
+function resolveClaudeExecutable(environment = process.env) {
+  // 保留现有未公开变量的优先级，使显式进程环境仍可覆盖原生设置文件加载的兼容键。
+  const legacy = environment.HARNESS_MIX_CLAUDE_EXECUTABLE;
+  const canonical = environment.HARNESSMIX_CLAUDE_COMMAND;
+  const configured = legacy || canonical;
+  if (!configured) return { configured: null, executable: null, source: 'sdk' };
+  return {
+    configured,
+    executable: resolveCmdShim(configured),
+    source: legacy ? 'HARNESS_MIX_CLAUDE_EXECUTABLE' : 'HARNESSMIX_CLAUDE_COMMAND',
+  };
+}
+
+function claudeVersionCommand(executable) {
+  return /\.(?:[cm]?js)$/i.test(executable)
+    ? { command: process.execPath, args: [executable, '--version'] }
+    : { command: executable, args: ['--version'] };
+}
+
+function bundledClaudeCodeLabel() {
+  const sdkEntry = require.resolve('@anthropic-ai/claude-agent-sdk');
+  const metadata = JSON.parse(fs.readFileSync(path.join(path.dirname(sdkEntry), 'package.json'), 'utf8'));
+  if (metadata.claudeCodeVersion) return `Claude Code ${metadata.claudeCodeVersion}`;
+  if (metadata.version) return `Agent SDK ${metadata.version}（Claude Code 版本未知）`;
+  return 'Claude Code（版本未知）';
+}
+
 function normalizeClaudePermissionMode(mode) {
   if (mode === 'yolo' || mode === 'skip' || mode === 'dangerously-skip-permissions') {
     return 'bypassPermissions';
@@ -272,6 +315,7 @@ function normalizeClaudePermissionMode(mode) {
 /** 建立一个常驻 SDK 会话（open 与 fork 共用）：构造 query、启动事件泵 */
 function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelId, effort, emit, collaboration, managedMcp = [], onPlanLimit, isWorker = false }) {
   const input = new MessageQueue();
+  const claudeExecutable = resolveClaudeExecutable();
   const normalizedPermissionMode = normalizeClaudePermissionMode(permissionMode) || (isWorker ? 'bypassPermissions' : undefined);
   const isBypass = normalizedPermissionMode === 'bypassPermissions' || isWorker;
 
@@ -326,7 +370,7 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
       ...(normalizedPermissionMode ? { permissionMode: normalizedPermissionMode } : {}),
       ...(isBypass ? { allowDangerouslySkipPermissions: true } : {}),
       ...(modelId ? { model: modelId } : {}),
-      ...(process.env.HARNESS_MIX_CLAUDE_EXECUTABLE ? { pathToClaudeCodeExecutable: process.env.HARNESS_MIX_CLAUDE_EXECUTABLE } : {}),
+      ...(claudeExecutable.executable ? { pathToClaudeCodeExecutable: claudeExecutable.executable } : {}),
       hooks: {
         SubagentStart: [{ hooks: [async (input) => {
           if (input.agent_id && input.session_id) {
@@ -443,15 +487,21 @@ function create() {
     },
 
     async inspect() {
-      const result = await new Promise((resolve) => {
-        const { command, args } = cliSpawn("claude", ["--version"]);
-        execFile(command, args, { windowsHide: true }, (error, stdout) => resolve({ ok: !error, stdout }));
-      });
       try { await loadSdk(); }
       catch { return { available: false, detail: "缺少 @anthropic-ai/claude-agent-sdk（npm install）" }; }
+      let selected;
+      try { selected = resolveClaudeExecutable(); }
+      catch (error) { return { available: false, detail: error.message }; }
+      if (!selected.executable) {
+        return { available: true, detail: `Agent SDK 内置 ${bundledClaudeCodeLabel()}` };
+      }
+      const result = await new Promise((resolve) => {
+        const { command, args } = claudeVersionCommand(selected.executable);
+        execFile(command, args, { windowsHide: true, timeout: 10_000 }, (error, stdout) => resolve({ ok: !error, stdout, error }));
+      });
       return result.ok
-        ? { available: true, detail: `claude ${String(result.stdout).trim()} · Agent SDK` }
-        : { available: true, detail: "Agent SDK 就绪（内置原生 CLI；未检测到独立 claude 命令）" };
+        ? { available: true, detail: `${String(result.stdout).trim()} · ${selected.source}` }
+        : { available: false, detail: `Claude 命令不可用（${selected.source}）：${result.error.message}` };
     },
 
     async inspectIntegrations(session) {
@@ -623,4 +673,6 @@ module.exports = {
   projectEvent,
   spawnSession,
   nativeSubagentMessages,
+  resolveCmdShim,
+  resolveClaudeExecutable,
 };
