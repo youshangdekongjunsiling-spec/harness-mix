@@ -23,6 +23,7 @@ function applyPendingHistoryRepair(directory) {
   const currentFingerprint=fingerprint(current);
   const alreadyApplied=currentFingerprint===fingerprint(replacement);
   if(!alreadyApplied && currentFingerprint!==manifest.expectedFingerprint) throw new Error('History changed after repair preparation; original preserved, repair skipped');
+  const replacesStatus=Object.prototype.hasOwnProperty.call(replacement,'status');
   fs.mkdirSync(manifest.backupDirectory,{recursive:true});
   const backupRecord=path.join(manifest.backupDirectory,'record.before.json');
   const backupIndex=path.join(manifest.backupDirectory,'index.before.json');
@@ -33,11 +34,18 @@ function applyPendingHistoryRepair(directory) {
     for(const key of ['messages','coreState','tools','createdAt','updatedAt','storage','nativeHistorySnapshot','nativeHistorySync']){
       if(replacement[key]===undefined) delete updated[key]; else updated[key]=replacement[key];
     }
+    if(replacesStatus){
+      updated.status=replacement.status;
+      for(const key of ['error','errorKind']){
+        if(Object.prototype.hasOwnProperty.call(replacement,key)) updated[key]=replacement[key]; else delete updated[key];
+      }
+    }
     atomic(recordFile,updated);
   }
   const repaired=JSON.parse(fs.readFileSync(recordFile,'utf8'));
   const entry=index.threads.find(t=>t.id===manifest.threadId);
   entry.createdAt=repaired.createdAt; entry.updatedAt=repaired.updatedAt;
+  if(replacesStatus) entry.status=repaired.status;
   entry.nativeHistorySnapshot=repaired.nativeHistorySnapshot; entry.nativeHistorySync=repaired.nativeHistorySync; entry.messageCount=repaired.messages.length; entry.recordBytes=fs.statSync(recordFile).size;
   entry.preview=repaired.messages.find(m=>m.role==='user'&&m.text)?.text||entry.preview;
   index.savedAt=Date.now(); atomic(indexFile,index);

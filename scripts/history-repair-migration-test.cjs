@@ -28,6 +28,9 @@ try {
     nativeSessionId: 'synthetic-native-session',
     title: 'Keep this title',
     archived: true,
+    status: 'error',
+    error: 'synthetic old error',
+    errorKind: 'unknown',
     messages: [{ role: 'user', text: 'synthetic original' }],
     coreState: { thread: { id: threadId }, turns: [], items: [] },
     createdAt: 1,
@@ -39,9 +42,12 @@ try {
     archived: false,
     messages: [{ role: 'user', text: 'synthetic repaired' }],
     updatedAt: 3,
+    status: 'ready',
   };
+  delete replacement.error;
+  delete replacement.errorKind;
   write(recordFile, before);
-  write(indexFile, { schemaVersion: 3, threads: [{ id: threadId, title: before.title, archived: true }] });
+  write(indexFile, { schemaVersion: 3, threads: [{ id: threadId, title: before.title, archived: true, status: 'error' }] });
   write(replacementFile, replacement);
   const manifest = {
     version: 1,
@@ -58,10 +64,30 @@ try {
   const actual = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
   assert.equal(actual.title, before.title);
   assert.equal(actual.archived, true);
+  assert.equal(actual.status, 'ready');
+  assert.equal(Object.hasOwn(actual, 'error'), false);
+  assert.equal(Object.hasOwn(actual, 'errorKind'), false);
   assert.equal(actual.messages[0].text, 'synthetic repaired');
   assert.equal(JSON.parse(fs.readFileSync(indexFile, 'utf8')).threads[0].updatedAt, 3);
+  assert.equal(JSON.parse(fs.readFileSync(indexFile, 'utf8')).threads[0].status, 'ready');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'backup', 'record.before.json'), 'utf8')).messages[0].text, 'synthetic original');
   assert.equal(applyPendingHistoryRepair(directory).status, 'none');
+
+  // Legacy replacement files without an explicit status retain the old status/error behavior.
+  const legacyReplacementFile = path.join(root, 'legacy-replacement.json');
+  const legacyReplacement = { ...replacement };
+  delete legacyReplacement.status;
+  write(recordFile, before);
+  write(indexFile, { schemaVersion: 3, threads: [{ id: threadId, title: before.title, archived: true, status: 'error' }] });
+  write(legacyReplacementFile, legacyReplacement);
+  write(manifestFile, { ...manifest, replacementFile: legacyReplacementFile,
+    replacementSha256: hash(legacyReplacementFile), backupDirectory: path.resolve(root, 'legacy-backup') });
+  assert.equal(applyPendingHistoryRepair(directory).status, 'applied');
+  const legacyActual = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+  assert.equal(legacyActual.status, 'error');
+  assert.equal(legacyActual.error, before.error);
+  assert.equal(legacyActual.errorKind, before.errorKind);
+  assert.equal(JSON.parse(fs.readFileSync(indexFile, 'utf8')).threads[0].status, 'error');
 
   // A changed live transcript is never overwritten.
   write(recordFile, { ...before, messages: [{ role: 'user', text: 'synthetic live change' }] });
