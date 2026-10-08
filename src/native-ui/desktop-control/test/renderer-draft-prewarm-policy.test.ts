@@ -139,7 +139,8 @@ describe("Desktop connection snapshot discovery", () => {
     expect(onNotification).toHaveBeenCalledWith("thread/name/updated",
       { threadId: "parked-1", threadName: "After" });
   });
-  it("shows Claude sync failures only on their active thread and clears stale notices", () => {
+  it("scopes, dismisses and expires Claude sync notices by diagnostic episode", () => {
+    vi.useFakeTimers();
     const fixture = syncStatusTargetFixture("external-a");
     const manager = requestManagerFixture();
     let disposed = false;
@@ -157,48 +158,107 @@ describe("Desktop connection snapshot discovery", () => {
 
       fixture.deliver({
         method: "harnessmix/thread/nativeHistorySync/updated",
-        params: { threadId: "external-a", status: "paused" },
+        params: { threadId: "external-a", status: "paused", reason: "branch-a" },
       });
       expect(fixture.notice()?.textContent).toContain("Alpha");
       fixture.deliver({
         method: "harnessmix/thread/nativeHistorySync/updated",
-        params: { threadId: "external-b", status: "error" },
+        params: { threadId: "external-b", status: "error", reason: "read-failed" },
       });
       expect(fixture.notice()?.textContent).toContain("Alpha");
 
       fixture.navigate("external-b");
       expect(fixture.notice()?.textContent).toContain("Beta");
       expect(fixture.notice()?.textContent).toContain("等待重试");
+      fixture.dismiss();
+      expect(fixture.notice()).toBeNull();
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error", reason: "read-failed" },
+      });
+      expect(fixture.notice()).toBeNull();
+      fixture.navigate("external-a");
+      expect(fixture.notice()?.textContent).toContain("Alpha");
+      fixture.navigate("external-b");
+      expect(fixture.notice()).toBeNull();
+
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error", reason: "source-changed" },
+      });
+      expect(fixture.notice()?.textContent).toContain("Beta");
+      vi.advanceTimersByTime(4_000);
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error", reason: "source-changed" },
+      });
+      vi.advanceTimersByTime(3_999);
+      expect(fixture.notice()).not.toBeNull();
+      vi.advanceTimersByTime(1);
+      expect(fixture.notice()).toBeNull();
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error", reason: "source-changed" },
+      });
+      expect(fixture.notice()).toBeNull();
+
+      (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
+      disposed = true;
+      installDraftPrewarmPolicyBridge(manager, requestBridgeFixture(), "local", fixture.target,
+        { discardAllPrewarmedThreads: vi.fn() });
+      disposed = false;
+      fixture.deliver({
+        method: "thread/started",
+        params: { thread: { id: "external-b", modelProvider: "harnessmix", name: "Beta" } },
+      });
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-b", status: "error", reason: "source-changed" },
+      });
+      expect(fixture.notice()).toBeNull();
       fixture.deliver({
         method: "harnessmix/thread/nativeHistorySync/updated",
         params: { threadId: "external-b", status: "waiting" },
       });
       expect(fixture.notice()).toBeNull();
-
-      fixture.navigate("external-a");
-      expect(fixture.notice()?.textContent).toContain("Alpha");
       fixture.deliver({
         method: "harnessmix/thread/nativeHistorySync/updated",
-        params: { threadId: "external-a", status: "synced" },
+        params: { threadId: "external-b", status: "error", reason: "source-changed" },
       });
-      expect(fixture.notice()).toBeNull();
-      fixture.deliver({
-        method: "harnessmix/thread/nativeHistorySync/updated",
-        params: { threadId: "external-a", status: "error" },
-      });
-      expect(fixture.notice()).not.toBeNull();
+      expect(fixture.notice()?.textContent).toContain("Beta");
       fixture.navigate("official-thread");
       expect(fixture.notice()).toBeNull();
       (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
       disposed = true;
-      expect(fixture.observerDisconnect).toHaveBeenCalledOnce();
+      expect(fixture.observerDisconnect).toHaveBeenCalledTimes(2);
       expect(fixture.notice()).toBeNull();
     } finally {
       if (!disposed) {
         (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void } | undefined)
           ?.dispose();
       }
+      vi.useRealTimers();
     }
+  });
+  it("ignores corrupt persisted sync-notice dismissals", () => {
+    const fixture = syncStatusTargetFixture("external-a");
+    fixture.target.sessionStorage?.setItem(
+      "harnessmix:native-history-sync-dismissals:v1",
+      "{not-json",
+    );
+    expect(() => installDraftPrewarmPolicyBridge(
+      requestManagerFixture(),
+      requestBridgeFixture(),
+      "local",
+      fixture.target,
+      { discardAllPrewarmedThreads: vi.fn() },
+    )).not.toThrow();
+    fixture.deliver({
+      method: "harnessmix/thread/nativeHistorySync/updated",
+      params: { threadId: "external-a", status: "paused", reason: "branch-a" },
+    });
+    expect(fixture.notice()).not.toBeNull();
+    (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
   });
   it("explicitly rejects unsupported remote approval hooks before changing transport", () => {
     const bridge = requestBridgeFixture();
@@ -368,11 +428,14 @@ function syncStatusTargetFixture(initialThreadId: string): {
   notice(): { id: string; textContent: string | null } | null;
   navigate(threadId: string): void;
   deliver(value: Record<string, unknown>): void;
+  dismiss(): void;
   observerDisconnect: ReturnType<typeof vi.fn>;
 } {
   let activeThreadId = initialThreadId;
   let mutationListener: (() => void) | null = null;
+  let dismissListener: (() => void) | null = null;
   const observerDisconnect = vi.fn();
+  const sessionValues = new Map<string, string>();
   const notices = new Map<string, {
     id: string;
     textContent: string | null;
@@ -412,15 +475,28 @@ function syncStatusTargetFixture(initialThreadId: string): {
         observerDisconnect();
       }
     },
+    sessionStorage: {
+      getItem: (key) => sessionValues.get(key) ?? null,
+      setItem: (key, value) => sessionValues.set(key, value),
+    },
     document: {
       getElementById: (id) => notices.get(id) ?? null,
       querySelectorAll: () => [marker],
-      createElement: () => {
+      createElement: (tag) => {
+        const attributes = new Map<string, string>();
         const element = {
           id: "",
           textContent: null as string | null,
           style: { cssText: "" },
-          setAttribute: vi.fn(),
+          setAttribute: (name: string, value: string) => attributes.set(name, value),
+          getAttribute: (name: string) => attributes.get(name) ?? null,
+          addEventListener: (type: string, listener: () => void) => {
+            if (tag === "button" && type === "click") dismissListener = listener;
+          },
+          appendChild: (child: { textContent: string | null }) => {
+            element.textContent = `${element.textContent ?? ""}${child.textContent ?? ""}`;
+            return child;
+          },
           remove: () => notices.delete(element.id),
         };
         return element;
@@ -450,6 +526,9 @@ function syncStatusTargetFixture(initialThreadId: string): {
     },
     deliver(value) {
       (target.__harnessmixSidecarReceiveV1 as (frame: string) => void)(JSON.stringify(value));
+    },
+    dismiss() {
+      dismissListener?.();
     },
     observerDisconnect,
   };

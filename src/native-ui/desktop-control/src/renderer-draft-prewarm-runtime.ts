@@ -23,6 +23,8 @@ interface SyncStatusElement {
   textContent: string | null;
   parentElement?: SyncStatusElement | null;
   style: { cssText: string };
+  appendChild?(element: SyncStatusElement): unknown;
+  addEventListener?(type: string, listener: () => void): void;
   getAttribute?(name: string): string | null;
   getClientRects?(): { length: number };
   setAttribute(name: string, value: string): void;
@@ -42,6 +44,10 @@ export interface DraftPrewarmPolicyTarget {
   MutationObserver?: new (listener: () => void) => {
     observe(target: unknown, options: Record<string, unknown>): void;
     disconnect(): void;
+  };
+  sessionStorage?: {
+    getItem(key: string): string | null;
+    setItem(key: string, value: string): void;
   };
   [key: string]: unknown;
   addEventListener?: (type: string, listener: (event: Event) => void) => void;
@@ -128,8 +134,38 @@ export function installDraftPrewarmPolicyBridge(
   const knownExternalThreadIds = new Set<string>();
   const knownOfficialThreadIds = new Set<string>();
   const externalThreadTitles = new Map<string, string>();
-  const nativeHistorySyncNotices = new Map<string, "paused" | "error">();
+  const nativeHistorySyncNotices = new Map<
+    string,
+    { status: "paused" | "error"; fingerprint: string }
+  >();
+  const nativeHistorySyncDismissals = new Map<string, string>();
   const syncNoticeElementId = "harnessmix-sync-status";
+  const syncNoticeDismissalStorageKey = "harnessmix:native-history-sync-dismissals:v1";
+  let syncNoticeDismissTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  try {
+    const persisted = JSON.parse(
+      target.sessionStorage?.getItem(syncNoticeDismissalStorageKey) ?? "null",
+    );
+    if (isRecord(persisted)) {
+      for (const [threadId, fingerprint] of Object.entries(persisted)) {
+        if (typeof fingerprint === "string") {
+          nativeHistorySyncDismissals.set(threadId, fingerprint);
+        }
+      }
+    }
+  } catch {
+    // A disabled or corrupt session store must never affect the renderer bridge.
+  }
+  const persistNativeHistorySyncDismissals = (): void => {
+    try {
+      target.sessionStorage?.setItem(
+        syncNoticeDismissalStorageKey,
+        JSON.stringify(Object.fromEntries(nativeHistorySyncDismissals)),
+      );
+    } catch {
+      // Session storage is optional in hardened or private renderer contexts.
+    }
+  };
   const catalogStore = isLocalSidecarHost ? manager.threadStore : undefined;
   const originalObserveCatalogThreads = catalogStore?.observeCatalogThreads;
   const originalRunRecentConversationRefresh = catalogStore?.runRecentConversationRefresh;
@@ -278,24 +314,51 @@ export function installDraftPrewarmPolicyBridge(
     if (!noticeDocument) return;
     const previous = noticeDocument.getElementById(syncNoticeElementId);
     const threadId = activeThreadId();
-    const status = threadId ? nativeHistorySyncNotices.get(threadId) : undefined;
-    if (!threadId || !status) {
+    const diagnostic = threadId ? nativeHistorySyncNotices.get(threadId) : undefined;
+    if (
+      !threadId ||
+      !diagnostic ||
+      nativeHistorySyncDismissals.get(threadId) === diagnostic.fingerprint
+    ) {
+      if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
+      syncNoticeDismissTimer = null;
       previous?.remove();
       return;
     }
-    const notice = previous || noticeDocument.createElement("div");
-    if (!previous) {
-      notice.id = syncNoticeElementId;
-      notice.setAttribute("role", "status");
-      notice.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;max-width:420px;padding:12px 16px;background:#fff4d6;color:#443414;border:1px solid #b99a54;border-radius:8px;font:13px/1.5 system-ui;box-shadow:0 2px 12px #0003";
-    }
     const title = externalThreadTitles.get(threadId);
     const threadLabel = title ? `「${title}」` : `线程 ${threadId}`;
-    const text = status === "paused"
+    const text = diagnostic.status === "paused"
       ? `Claude 历史同步已暂停（${threadLabel}）：源分支或本地记录发生变化。现有历史已保留，请检查后再继续同步。`
       : `Claude 历史同步暂时失败（${threadLabel}），正在等待重试。现有历史已保留。`;
-    if (notice.textContent !== text) notice.textContent = text;
-    if (!previous) noticeDocument.body?.appendChild(notice);
+    const signature = JSON.stringify([threadId, diagnostic.fingerprint, text]);
+    if (previous?.getAttribute?.("data-harnessmix-sync-signature") === signature) return;
+    if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
+    syncNoticeDismissTimer = null;
+    previous?.remove();
+    const notice = noticeDocument.createElement("div");
+    notice.id = syncNoticeElementId;
+    notice.setAttribute("role", "status");
+    notice.setAttribute("data-harnessmix-sync-signature", signature);
+    notice.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;max-width:420px;padding:12px 42px 12px 16px;background:#fff4d6;color:#443414;border:1px solid #b99a54;border-radius:8px;font:13px/1.5 system-ui;box-shadow:0 2px 12px #0003";
+    const message = noticeDocument.createElement("span");
+    message.textContent = text;
+    const dismiss = noticeDocument.createElement("button");
+    dismiss.textContent = "×";
+    dismiss.setAttribute("type", "button");
+    dismiss.setAttribute("aria-label", "关闭 Claude 历史同步提示");
+    dismiss.style.cssText = "position:absolute;top:6px;right:8px;border:0;background:transparent;color:inherit;font:20px/1 system-ui;cursor:pointer;padding:4px";
+    const dismissNotice = (): void => {
+      if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
+      syncNoticeDismissTimer = null;
+      nativeHistorySyncDismissals.set(threadId, diagnostic.fingerprint);
+      persistNativeHistorySyncDismissals();
+      notice.remove();
+    };
+    dismiss.addEventListener?.("click", dismissNotice);
+    notice.appendChild?.(message);
+    notice.appendChild?.(dismiss);
+    noticeDocument.body?.appendChild(notice);
+    syncNoticeDismissTimer = globalThis.setTimeout(dismissNotice, 8_000);
   };
   const observeBridgeResult = (
     request: { method: string; parameters: unknown } | undefined,
@@ -337,6 +400,9 @@ export function installDraftPrewarmPolicyBridge(
       knownOfficialThreadIds.delete(request.parameters.threadId);
       externalThreadTitles.delete(request.parameters.threadId);
       nativeHistorySyncNotices.delete(request.parameters.threadId);
+      if (nativeHistorySyncDismissals.delete(request.parameters.threadId)) {
+        persistNativeHistorySyncDismissals();
+      }
       renderNativeHistorySyncNotice();
     }
   };
@@ -353,9 +419,19 @@ export function installDraftPrewarmPolicyBridge(
       const status = value.params;
       if (typeof status.threadId === "string") {
         if (status.status === "paused" || status.status === "error") {
-          nativeHistorySyncNotices.set(status.threadId, status.status);
+          nativeHistorySyncNotices.set(status.threadId, {
+            status: status.status,
+            fingerprint: JSON.stringify([
+              status.status,
+              status.reason ?? null,
+              status.detail ?? null,
+            ]),
+          });
         } else {
           nativeHistorySyncNotices.delete(status.threadId);
+          if (nativeHistorySyncDismissals.delete(status.threadId)) {
+            persistNativeHistorySyncDismissals();
+          }
         }
         renderNativeHistorySyncNotice();
       }
@@ -924,6 +1000,7 @@ export function installDraftPrewarmPolicyBridge(
       return Promise.resolve();
     },
     dispose(): void {
+      if (bridgeState === "disposed") return;
       if (bridge.sendRequest === routedSend) bridge.sendRequest = originalSend;
       const exposedBridge = target.__harnessmixRequestBridgeV1 as { bridge?: unknown } | undefined;
       if (exposedBridge?.bridge === bridge) {
@@ -954,6 +1031,8 @@ export function installDraftPrewarmPolicyBridge(
       target.removeEventListener?.("popstate", syncNoticeNavigationListener);
       target.removeEventListener?.("hashchange", syncNoticeNavigationListener);
       syncNoticeNavigationObserver?.disconnect();
+      if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
+      syncNoticeDismissTimer = null;
       target.document?.getElementById(syncNoticeElementId)?.remove();
       if (responseMethod && manager[responseMethod] === routedDispatchAppServerResponse) {
         manager[responseMethod] = originalDispatchAppServerResponse;
