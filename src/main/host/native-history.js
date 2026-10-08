@@ -3,9 +3,37 @@ const path = require('node:path');
 const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { CodexAppServer } = require('../adapters/codex-app-server');
+const { projectClaudeHistory, mergeClaudeTimestamps } = require('./claude-history');
 
 const text = value => typeof value === 'string' ? value : Array.isArray(value) ? value.filter(v => v.type === 'text' || v.type === 'input_text').map(v => v.text || '').join('\n') : '';
 const message = (role, value, at) => ({ id: randomUUID(), role, text: text(value), at: at || 0 });
+
+async function claudeSessionFile(sessionId, cwd) {
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId || '')) return null;
+  const root = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const file = path.join(root, entry.name, `${sessionId}.jsonl`);
+    try { if ((await fs.stat(file)).isFile()) matches.push(file); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  if (matches.length <= 1) return matches[0] ?? null;
+  for (const file of matches) {
+    const rows = await claudeRawEntries(file);
+    if (rows.some(row => row?.sessionId === sessionId && row.cwd === cwd)) return file;
+  }
+  return null;
+}
+
+async function claudeRawEntries(file) {
+  if (!file) return [];
+  try {
+    const data = await fs.readFile(file, 'utf8');
+    return data.split(/\r?\n/).filter(Boolean).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
+  } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+}
 
 async function piRows(directory) {
   const rows = [];
@@ -39,7 +67,9 @@ async function listNative(harnessId) {
   if (harnessId === 'pi') return piRows(path.join(process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'), 'sessions'));
   if (harnessId === 'claude') {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
-    return (await sdk.listSessions()).filter(s => path.isAbsolute(s.cwd || '')).map(s => ({ nativeSessionId: s.sessionId, title: s.customTitle || s.summary || null, cwd: s.cwd, updatedAt: s.lastModified, running: null }));
+    const sessions = (await sdk.listSessions()).filter(s => path.isAbsolute(s.cwd || ''));
+    return Promise.all(sessions.map(async s => ({ nativeSessionId: s.sessionId, title: s.customTitle || s.summary || null, cwd: s.cwd,
+      updatedAt: s.lastModified, running: null, nativeSessionFile: await claudeSessionFile(s.sessionId, s.cwd) })));
   }
   if (harnessId === 'codex') {
     const host = await CodexAppServer.acquire();
@@ -64,7 +94,16 @@ async function readNative(harnessId, candidate) {
   if (candidate.messages) return candidate.messages;
   if (harnessId === 'claude') {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
-    return (await sdk.getSessionMessages(candidate.nativeSessionId, { dir: candidate.cwd })).filter(m => ['user', 'assistant'].includes(m.type) && !m.parent_tool_use_id).map(m => message(m.type, m.message?.content, candidate.updatedAt));
+    // The SDK resolves the active parentUuid branch. Its runtime currently returns
+    // timestamps, but the public SessionMessage type does not promise them. Rejoin
+    // the raw JSONL timestamp by stable uuid so future SDK versions cannot collapse
+    // an import to epoch zero.
+    const rows = await sdk.getSessionMessages(candidate.nativeSessionId, { dir: candidate.cwd });
+    const sourceFile = candidate.nativeSessionFile || await claudeSessionFile(candidate.nativeSessionId, candidate.cwd);
+    const enriched = mergeClaudeTimestamps(rows, await claudeRawEntries(sourceFile), candidate.updatedAt);
+    // Preserve Claude's block structure so tool_result protocol rows remain tools,
+    // rather than becoming empty user messages in the imported conversation.
+    return projectClaudeHistory(enriched);
   }
   if (harnessId === 'codex') {
     const host = await CodexAppServer.acquire();

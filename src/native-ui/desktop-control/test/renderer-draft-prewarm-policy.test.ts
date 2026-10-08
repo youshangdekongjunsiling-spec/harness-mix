@@ -705,32 +705,59 @@ describe("Renderer draft prewarm policy", () => {
 
   it("loads external sessions into the native catalog after the sidecar attaches", async () => {
     const observeCatalogThreads = vi.fn();
+    const runRecentConversationRefresh = vi.fn(async (_request: unknown, source: unknown) => {
+      observeCatalogThreads([]);
+      return source;
+    });
+    const upsertConversationFromThread = vi.fn();
     const manager: RendererHostRequestManager = {
       ...requestManagerFixture(),
-      threadStore: { observeCatalogThreads },
+      threadStore: {
+        observeCatalogThreads,
+        runRecentConversationRefresh,
+        upsertConversationFromThread,
+      },
     };
     const { bridge, directSend } = remoteRequestBridgeFixture();
     const external = { id: "external-1", modelProvider: "harnessmix" };
     const official = { id: "official-1", modelProvider: "openai" };
     const target: DraftPrewarmPolicyTarget = { __harnessmixSidecarModeV1: true };
+    let deliverBootstrap: (() => void) | undefined;
     target.__harnessmixSidecarSendV1 = (frame: string) => {
       const request = JSON.parse(frame) as { id: number; method: string };
       expect(request.method).toBe("harnessmix/thread/list");
-      queueMicrotask(() => {
+      deliverBootstrap = () => {
         (target.__harnessmixSidecarReceiveV1 as (frame: string) => void)(
           JSON.stringify({ id: request.id, result: { data: [external] } }),
         );
-      });
+      };
     };
     installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
       discardAllPrewarmedThreads: vi.fn(),
     });
+    await vi.waitFor(() => expect(deliverBootstrap).toBeTypeOf("function"));
+    await expect(manager.threadStore?.runRecentConversationRefresh?.({}, "catalog"))
+      .resolves.toBe("catalog");
+    expect(upsertConversationFromThread).not.toHaveBeenCalled();
+    deliverBootstrap?.();
     await vi.waitFor(() => expect(observeCatalogThreads).toHaveBeenCalledWith([external]));
+    await vi.waitFor(() =>
+      expect(upsertConversationFromThread).toHaveBeenCalledWith(external, "stored"));
+    upsertConversationFromThread.mockClear();
+    await expect(manager.threadStore?.runRecentConversationRefresh?.({}, "catalog"))
+      .resolves.toBe("catalog");
+    expect(observeCatalogThreads).toHaveBeenLastCalledWith([external]);
+    expect(upsertConversationFromThread).toHaveBeenCalledWith(external, "stored");
+    await expect(manager.threadStore?.runRecentConversationRefresh?.({}, "remote"))
+      .resolves.toBe("remote");
+    expect(observeCatalogThreads).toHaveBeenLastCalledWith([]);
+    expect(upsertConversationFromThread).toHaveBeenCalledTimes(1);
     manager.threadStore?.observeCatalogThreads?.([official]);
     expect(observeCatalogThreads).toHaveBeenLastCalledWith([official, external]);
     expect(directSend).not.toHaveBeenCalled();
     (target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
     expect(manager.threadStore?.observeCatalogThreads).toBe(observeCatalogThreads);
+    expect(manager.threadStore?.runRecentConversationRefresh).toBe(runRecentConversationRefresh);
   });
 
   it("keeps official Codex usable when the separate Host fails", async () => {

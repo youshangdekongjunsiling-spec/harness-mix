@@ -36,7 +36,12 @@ async function runNativeHost() {
   const traffic = (kind, message) => {
     try { fs.appendFileSync(trafficLog, JSON.stringify({ ts: Date.now(), pid: process.pid, kind, message: redact(slim(message)) }) + '\n'); } catch {}
   };
-  const runtime = new HostRuntime({ dataDirectory: directory });
+  // Apply a verified one-time snapshot repair before this process loads the store.
+  try {
+    const repair = require('./pending-history-repair').applyPendingHistoryRepair(directory);
+    if (repair.status !== 'none') traffic('history-repair', repair);
+  } catch (error) { traffic('history-repair-skipped', { message: error.message }); }
+  const runtime = new HostRuntime({ dataDirectory: directory, claudeHistorySync: require('./claude-sync-options').createClaudeHistorySyncOptions() });
   // Heartbeat: lets the launcher tell a live instance from leftovers, and gives
   // crash recovery a timestamp to reason about.
   const startedAt = Date.now();

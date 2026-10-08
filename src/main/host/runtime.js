@@ -20,6 +20,7 @@ const { UsageHistory } = require('./usage-history');
 const { HealthCenter } = require('./health');
 const { storageProjection } = require('./thread-storage');
 const { createWorkspace, inspectWorkspace, reviewWorkspace, applyWorkspace, removeWorkspace, discardWorkspace, pushWorkspace } = require('./collaboration-worktree');
+const { ClaudeHistorySync, checkpointFingerprint, isEligibleClaudeHistorySyncThread } = require('./claude-history-sync');
 
 /**
  * Host Runtime：harness-mix 的核心职责 —— 自研 Desktop 背后的
@@ -29,7 +30,7 @@ const { createWorkspace, inspectWorkspace, reviewWorkspace, applyWorkspace, remo
  */
 class HostRuntime {
   constructor({ dataDirectory, observer = null, stuckTurnMs = 15 * 60 * 1000, stuckSweepMs = 60 * 1000,
-    delegationTimeoutMs = 30 * 60 * 1000 }) {
+    delegationTimeoutMs = 30 * 60 * 1000, claudeHistorySync = null }) {
     this.store = new ThreadStore(dataDirectory);
     this.threads = [];
     this.sessions = new Map(); // threadId -> { adapter, ...session }
@@ -77,6 +78,7 @@ class HostRuntime {
     this.execution = new CoreSession();
     this.core = this.execution.core;
     this.observer = observer;
+    this.claudeHistorySync = claudeHistorySync ? new ClaudeHistorySync({ runtime: this, ...claudeHistorySync }) : null;
   }
 
   async initialize() {
@@ -133,6 +135,7 @@ class HostRuntime {
       this.execution.threadCreated(thread);
     }
     await this.#save();
+    this.claudeHistorySync?.start();
   }
 
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -1062,6 +1065,7 @@ class HostRuntime {
 
   async close() {
     clearInterval(this.watchdogTimer);
+    await this.claudeHistorySync?.stop();
     await this.collaboration.close();
     await this.handoffAccess.close();
     clearTimeout(this.saveTimer); clearTimeout(this.broadcastTimer);
@@ -1303,6 +1307,122 @@ class HostRuntime {
     for (const listener of this.listeners) listener({ type: 'thread-created', thread });
     this.#broadcast();
     return thread;
+  }
+
+  /** Explicitly enabled, already-imported Claude sources eligible for one-way append sync. */
+  listClaudeHistorySyncSources() {
+    return this.threads.flatMap(thread => {
+      const sync = thread.nativeHistorySync;
+      const sourceFile = sync?.sourceFile || thread.nativeSessionFile;
+      if (!isEligibleClaudeHistorySyncThread(thread) || typeof sourceFile !== 'string') return [];
+      return [{ threadId: thread.id, harnessId: thread.harnessId, sourceFile,
+        enabled: true, paused: sync.paused === true, status: sync.status,
+        reason: sync.reason, detail: sync.detail, cursor: structuredClone(sync.cursor ?? {}) }];
+    });
+  }
+
+  isClaudeHistorySyncBusy(threadId) {
+    const thread = this.threads.find(value => value.id === threadId);
+    return !thread || this.openings.has(threadId) || this.sending.has(threadId)
+      || this.switching.has(threadId) || this.execution.isRunning(threadId)
+      || thread.status === 'opening' || thread.status === 'working';
+  }
+
+  prepareClaudeHistorySync(threadId) {
+    const thread = this.#requireThread(threadId);
+    return { thread, checkpoint: this.execution.checkpoint(thread) };
+  }
+
+  async updateClaudeHistorySyncStatus(threadId, patch) {
+    if (!this.threads.some(value => value.id === threadId)) return;
+    const thread = this.#requireThread(threadId);
+    const previous = thread.nativeHistorySync ?? {};
+    const next = { ...previous, ...patch };
+    delete next.result;
+    if (!patch.reason) delete next.reason;
+    if (!patch.detail) delete next.detail;
+    const semantic = value => JSON.stringify({ ...value, checkedAt: undefined });
+    if (semantic(previous) === semantic(next)) return;
+    thread.nativeHistorySync = next;
+    await this.#save();
+    const event = { type: 'native-history-sync-status', threadId, status: next.status,
+      ...(next.reason ? { reason: next.reason } : {}), ...(next.detail ? { detail: next.detail } : {}) };
+    for (const listener of this.listeners) listener(event);
+  }
+
+  announceClaudeHistorySyncStatus(threadId) {
+    const thread = this.threads.find(value => value.id === threadId);
+    const sync = thread?.nativeHistorySync;
+    if (!sync?.status) return;
+    for (const listener of this.listeners) listener({ type: 'native-history-sync-status', threadId,
+      status: sync.status, ...(sync.reason ? { reason: sync.reason } : {}),
+      ...(sync.detail ? { detail: sync.detail } : {}) });
+  }
+
+  async commitClaudeHistorySync(threadId, candidate, cursor) {
+    if (this.isClaudeHistorySyncBusy(threadId)) {
+      const error = new Error('Host thread became active while Claude history was being projected');
+      error.code = 'CLAUDE_HISTORY_TARGET_CONFLICT';
+      throw error;
+    }
+    const thread = this.#requireThread(threadId);
+    const checkpoint = candidate?.checkpoint ?? candidate?.coreState;
+    if (!checkpoint || checkpoint.version !== 1 || checkpoint.thread?.id !== thread.id
+      || !Array.isArray(checkpoint.turns) || !Array.isArray(checkpoint.items)
+      || !Array.isArray(candidate?.messages)) {
+      const error = new Error('Claude history projector returned an invalid target snapshot');
+      error.code = 'CLAUDE_HISTORY_TARGET_CONFLICT';
+      throw error;
+    }
+    const before = this.execution.checkpoint(thread);
+    const expectedTarget = thread.nativeHistorySync?.cursor?.targetFingerprint;
+    if (typeof expectedTarget !== 'string' || checkpointFingerprint(before) !== expectedTarget) {
+      const error = new Error('Host history changed after the last synchronized checkpoint');
+      error.code = 'CLAUDE_HISTORY_TARGET_CONFLICT';
+      throw error;
+    }
+    const previousTurnIds = before.turns.map(turn => turn.id);
+    const nextTurnIds = checkpoint.turns.map(turn => turn.id);
+    if (previousTurnIds.some((id, index) => nextTurnIds[index] !== id)) {
+      const error = new Error('Host history is not an unchanged prefix of the Claude projection');
+      error.code = 'CLAUDE_HISTORY_TARGET_CONFLICT';
+      throw error;
+    }
+    const nextItems = new Map(checkpoint.items.map(item => [item.id, item]));
+    if (before.items.some(item => !nextItems.has(item.id))) {
+      const error = new Error('Claude projection would remove Host history items');
+      error.code = 'CLAUDE_HISTORY_TARGET_CONFLICT';
+      throw error;
+    }
+
+    const beforeTurns = new Map(before.turns.map(turn => [turn.id, turn]));
+    const beforeItems = new Map(before.items.map(item => [item.id, item]));
+    const newTurnIds = nextTurnIds.filter(id => !beforeTurns.has(id));
+    const changedItemIds = checkpoint.items.filter(item => !beforeItems.has(item.id)
+      || JSON.stringify(beforeItems.get(item.id)) !== JSON.stringify(item)).map(item => item.id);
+    const changedItems = new Set(changedItemIds);
+    const changedTurnIds = checkpoint.turns.filter(turn => !beforeTurns.has(turn.id)
+      || JSON.stringify(beforeTurns.get(turn.id)) !== JSON.stringify(turn)
+      || turn.itemIds.some(id => changedItems.has(id))).map(turn => turn.id);
+
+    this.core.restore(checkpoint);
+    this.execution.lastTurns.set(thread.id, checkpoint.turns.at(-1)?.id);
+    thread.messages = structuredClone(candidate.messages);
+    thread.updatedAt = candidate.updatedAt ?? thread.updatedAt;
+    if (candidate.nativeHistorySnapshot) thread.nativeHistorySnapshot = structuredClone(candidate.nativeHistorySnapshot);
+    const nextCursor = { ...structuredClone(cursor), targetFingerprint: checkpointFingerprint(checkpoint) };
+    thread.nativeHistorySync = { ...(thread.nativeHistorySync ?? {}), enabled: true, paused: false,
+      status: 'synced', cursor: nextCursor, checkedAt: Date.now() };
+    delete thread.nativeHistorySync.reason;
+    delete thread.nativeHistorySync.detail;
+    this.#syncCore(thread);
+    await this.#save();
+    this.#broadcast();
+    for (const listener of this.listeners) listener({ type: 'native-history-synced', thread,
+      previousTurnIds, changedTurnIds, changedItemIds, newTurnIds });
+    for (const listener of this.listeners) listener({ type: 'native-history-sync-status', threadId,
+      status: 'synced' });
+    return { previousTurnIds, changedTurnIds, changedItemIds, newTurnIds, cursor: nextCursor };
   }
 
   async #syncNativeSubagent(parent, event) {

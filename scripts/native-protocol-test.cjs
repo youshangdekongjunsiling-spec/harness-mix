@@ -161,6 +161,9 @@ async function main() {
     schemas.harnessPluginListResultSchema.parse(await bridge.request('harnessmix/harness/plugins/list'));
     const started = await bridge.request('thread/start', { cwd: root, model: routeModel('pi') });
     const threadId = started.thread.id;
+    assert.deepEqual(await bridge.request('thread/attachment/list', { threadId, cursor: null, limit: 100 }), { data: [], nextCursor: null }, 'External sidebar hydration exposes the stock empty attachment page');
+    assert.equal(await bridge.request('thread/attachment/list', { threadId: 'official-unowned-thread', cursor: null, limit: 100 }), undefined, 'Official attachment requests retain stock routing');
+
     const threadInspection = await bridge.request('harnessmix/thread/inspect', { threadId });
     schemas.threadInspectionSchema.parse(threadInspection);
     assert.equal(threadInspection.workspace.hostManaged, true);

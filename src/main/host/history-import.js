@@ -9,7 +9,8 @@ function importHistory(core, thread) {
     if (thread.usage) core.dispatch({ threadId: thread.id, type: 'usage.updated', payload: thread.usage });
     for (const [index, message] of (thread.messages ?? []).entries()) {
       if (message.role !== 'assistant') continue;
-      const now = message.at ?? thread.createdAt ?? 0;
+      const user = thread.messages[index - 1];
+      const now = user?.role === 'user' ? user.at ?? message.at ?? thread.createdAt ?? 0 : message.at ?? thread.createdAt ?? 0;
       // Re-key on Fork: Core IDs are globally unique; native identities remain intact.
       const turnId = message.coreTurn?.threadId === thread.id ? message.coreTurn.id : `history_${thread.id}_${message.id ?? index}`;
       message.coreTurnId = turnId;
@@ -21,18 +22,17 @@ function importHistory(core, thread) {
         continue;
       }
       core.dispatch({ threadId: thread.id, turnId, type: 'turn.started', timestamp: now });
-      const add = (type, payload, at = now) => {
+      const add = (type, payload, at = now, endedAt = message.endedAt ?? at) => {
         const id = `${turnId}_${core.getTurn(turnId).itemIds.length}`;
         core.dispatch({ threadId: thread.id, turnId, itemId: id, type: 'item.started', payload: { type, ...payload }, timestamp: at });
-        core.dispatch({ threadId: thread.id, turnId, itemId: id, type: 'item.completed', timestamp: message.endedAt ?? at });
+        core.dispatch({ threadId: thread.id, turnId, itemId: id, type: 'item.completed', timestamp: endedAt });
       };
-      const user = thread.messages[index - 1];
-      if (user?.role === 'user') add('user_message', { content: user.text });
+      if (user?.role === 'user') add('user_message', { content: user.text, ...(user.attachments?.length ? { attachments: user.attachments } : {}) }, user.at ?? now, user.at ?? now);
       const ordered = message.items;
       if (ordered?.length) for (const item of ordered) {
         if (item.kind === 'tool') {
-          const tool = thread.tools?.find(t => t.id === item.toolId && t.messageId === message.id);
-          if (tool) add('tool_call', { title: tool.title, input: tool.input, output: tool.output ?? tool.detail, state: tool.state === 'running' ? 'interrupted' : tool.state, nativeRef: { toolCallId: tool.id } }, item.at);
+          const tool = item.tool ?? thread.tools?.find(t => t.id === item.toolId && t.messageId === message.id);
+          if (tool) add('tool_call', { title: tool.title, input: tool.input, output: tool.output ?? tool.detail, state: tool.state === 'running' ? 'interrupted' : tool.state, nativeRef: { toolCallId: tool.id } }, item.at, tool.endedAt ?? item.at);
         } else add(item.kind === 'thinking' ? 'reasoning' : 'agent_message', { content: item.text, phase: item.phase ?? 'progress' }, item.at);
       } else {
         if (message.thinking) add('reasoning', { content: message.thinking });

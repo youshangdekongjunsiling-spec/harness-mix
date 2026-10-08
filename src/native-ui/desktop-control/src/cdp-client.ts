@@ -79,6 +79,13 @@ function requiredText(value: unknown, field: string): string {
   return value;
 }
 
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`CDP target '${field}' must be text`);
+  }
+  return value;
+}
+
 function endpointUrl(value: string, protocols: readonly string[]): URL {
   const url = new URL(value);
   if (!protocols.includes(url.protocol)) {
@@ -96,7 +103,9 @@ function decodeTarget(value: unknown): CdpTarget {
     id: requiredText(value.id, "id"),
     type: requiredText(value.type, "type"),
     title: typeof value.title === "string" ? value.title : "",
-    url: requiredText(value.url, "url"),
+    // Chromium emits blank URLs for valid worker targets. They remain part of
+    // /json/list but can never win the app:// primary-renderer selection.
+    url: requiredString(value.url, "url"),
     webSocketDebuggerUrl: requiredText(value.webSocketDebuggerUrl, "webSocketDebuggerUrl"),
   };
   endpointUrl(target.webSocketDebuggerUrl, ["ws:", "wss:"]);

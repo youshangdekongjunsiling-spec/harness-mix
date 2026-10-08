@@ -18,7 +18,20 @@ export interface RendererWebContents {
   debugger: RendererDebugger;
 }
 
+interface SyncStatusElement {
+  id: string;
+  textContent: string | null;
+  style: { cssText: string };
+  setAttribute(name: string, value: string): void;
+  remove(): void;
+}
+
 export interface DraftPrewarmPolicyTarget {
+  document?: {
+    getElementById(id: string): SyncStatusElement | null;
+    createElement(tag: string): SyncStatusElement;
+    body?: { appendChild(element: SyncStatusElement): unknown } | null;
+  };
   [key: string]: unknown;
   addEventListener?: (type: string, listener: (event: Event) => void) => void;
   dispatchEvent?: (event: Event) => boolean;
@@ -45,6 +58,8 @@ export interface RendererHostRequestManager {
   sendAppServerResponse?(method: string, response: Record<string, unknown>): unknown;
   threadStore?: {
     observeCatalogThreads?: (threads: unknown[]) => void;
+    runRecentConversationRefresh?: (...args: unknown[]) => unknown;
+    upsertConversationFromThread?: (thread: unknown, source: "stored") => unknown;
   };
 }
 
@@ -103,6 +118,7 @@ export function installDraftPrewarmPolicyBridge(
   const knownOfficialThreadIds = new Set<string>();
   const catalogStore = isLocalSidecarHost ? manager.threadStore : undefined;
   const originalObserveCatalogThreads = catalogStore?.observeCatalogThreads;
+  const originalRunRecentConversationRefresh = catalogStore?.runRecentConversationRefresh;
   let externalCatalogThreads: unknown[] = [];
   // Current Desktop sidebars read the in-memory catalog. Their initial load
   // can finish before this bridge is installed, so thread/list merging alone
@@ -113,6 +129,25 @@ export function installDraftPrewarmPolicyBridge(
       }
     : null;
   if (catalogStore && catalogObserver) catalogStore.observeCatalogThreads = catalogObserver;
+  // Desktop 26.1002 can switch recent-history state to the in-memory catalog
+  // without issuing another thread/list request. That refresh replaces recent
+  // summaries before returning, so replay the cached external rows afterwards.
+  const catalogRefreshObserver = catalogStore && catalogObserver &&
+    typeof originalRunRecentConversationRefresh === "function"
+    ? async function (this: typeof catalogStore, ...args: unknown[]): Promise<unknown> {
+        const result = await originalRunRecentConversationRefresh.apply(this, args);
+        if (args[1] === "catalog") {
+          this.observeCatalogThreads?.([]);
+          for (const thread of externalCatalogThreads) {
+            this.upsertConversationFromThread?.(thread, "stored");
+          }
+        }
+        return result;
+      }
+    : null;
+  if (catalogStore && catalogRefreshObserver) {
+    catalogStore.runRecentConversationRefresh = catalogRefreshObserver;
+  }
   const threadOwnershipResolutions = new Map<string, Promise<"external" | "codex">>();
   const createBridgeProcessHandle = (): string =>
     `harnessmix-${
@@ -252,6 +287,23 @@ export function installDraftPrewarmPolicyBridge(
     }
     if (typeof value.harnessmixSidecarFailure === "string") {
       failBridge(value.harnessmixSidecarFailure, false);
+      return;
+    }
+    if (value.method === "harnessmix/thread/nativeHistorySync/updated" && isRecord(value.params)) {
+      const status = value.params;
+      const noticeDocument = target.document;
+      if (noticeDocument && typeof status.threadId === "string") {
+        const elementId = "harnessmix-sync-status-" + status.threadId;
+        const previous = noticeDocument.getElementById(elementId);
+        if (status.status === "paused" || status.status === "error") {
+          const notice = previous || noticeDocument.createElement("div");
+          notice.id = elementId;
+          notice.setAttribute("role", "status");
+          notice.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;max-width:420px;padding:12px 16px;background:#fff4d6;color:#443414;border:1px solid #b99a54;border-radius:8px;font:13px/1.5 system-ui;box-shadow:0 2px 12px #0003";
+          notice.textContent = status.status === "paused" ? "Claude 历史同步已暂停：源分支或本地记录发生变化。现有历史已保留，请检查后再继续同步。" : "Claude 历史同步暂时失败，正在等待重试。现有历史已保留。";
+          if (!previous) noticeDocument.body?.appendChild(notice);
+        } else if (status.status === "synced") previous?.remove();
+      }
       return;
     }
     if (value.method === bridgeReadyMethod && value.id === undefined) {
@@ -486,6 +538,9 @@ export function installDraftPrewarmPolicyBridge(
         externalCatalogThreads = page.data;
         for (const thread of externalCatalogThreads) rememberExternalThread(thread);
         catalogStore.observeCatalogThreads?.([]);
+        for (const thread of externalCatalogThreads) {
+          catalogStore.upsertConversationFromThread?.(thread, "stored");
+        }
       })
       .catch(() => undefined);
   }
@@ -796,6 +851,12 @@ export function installDraftPrewarmPolicyBridge(
       }
       if (catalogStore && catalogObserver && catalogStore.observeCatalogThreads === catalogObserver) {
         catalogStore.observeCatalogThreads = originalObserveCatalogThreads!;
+      }
+      if (
+        catalogStore && catalogRefreshObserver &&
+        catalogStore.runRecentConversationRefresh === catalogRefreshObserver
+      ) {
+        catalogStore.runRecentConversationRefresh = originalRunRecentConversationRefresh!;
       }
       externalCatalogThreads = [];
       if (bridge.prewarmThreadStart === routedPrewarm) {

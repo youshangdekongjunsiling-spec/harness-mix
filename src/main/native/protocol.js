@@ -295,6 +295,30 @@ class NativeProtocol {
     this.unsubscribe = runtime.core.subscribe(({ event, projected }) => this.onCore(event, projected));
     // Host 侧新建的线程（协作子任务等）也要通知 Desktop 侧栏，与 thread/start 同一契约
     this.unsubscribeRuntime = runtime.subscribe(event => {
+      if (event?.type === 'native-history-synced' && event.thread) {
+        const threadId = event.thread.id;
+        const newTurns = new Set(event.newTurnIds || []);
+        const changedItems = new Set(event.changedItemIds || []);
+        this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread, false) } });
+        for (const turnId of event.changedTurnIds || []) {
+          const turn = runtime.core.getTurn(turnId);
+          if (!turn || turn.threadId !== threadId) continue;
+          if (newTurns.has(turnId)) this.emit({ method: 'turn/started', params: { threadId, turn: { ...this.turn(turn), status: 'inProgress', items: [] } } });
+          for (const item of runtime.core.getItemsForTurn(turnId)) {
+            if (!changedItems.has(item.id)) continue;
+            const converted = projectItem(item);
+            if (!converted) continue;
+            this.emit({ method: 'item/started', params: { threadId, turnId, item: converted, startedAtMs: item.createdAt } });
+            if (terminal(item.status)) this.emit({ method: 'item/completed', params: { threadId, turnId, item: converted, completedAtMs: item.updatedAt } });
+          }
+          this.emit({ method: 'turn/completed', params: { threadId, turn: this.turn(turn) } });
+        }
+        this.emit({ method: 'thread/status/changed', params: { threadId, status: { type: 'idle' } } });
+      }
+      if (event?.type === 'native-history-sync-status') {
+        this.emit({ method: 'harnessmix/thread/nativeHistorySync/updated', params: { threadId: event.threadId, status: event.status, reason: event.reason } });
+      }
+
       if (event?.type === 'thread-created' && event.thread) this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread) } });
       // 预热线程转正后重发 thread/started（ephemeral=false）：Desktop 侧边栏 state db
       // 只登记非 ephemeral 宣告的线程，不重发则转正会话不进项目列表
@@ -929,6 +953,10 @@ class NativeProtocol {
       return undefined;
     }
     if (method === 'thread/read') return { thread: this.projectThread(thread, params.includeTurns !== false) };
+    // Desktop 26.1002 hydrates sidebar rows with this read immediately after
+    // thread/list. Harness Mix does not persist a separate native attachment
+    // catalog, so expose the stock app-server's empty paginated shape.
+    if (method === 'thread/attachment/list') return { data: [], nextCursor: null };
     if (method === 'thread/queue/list') {
       const queue = this.getQueue(thread.id);
       return {

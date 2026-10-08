@@ -93,6 +93,48 @@ describe("CDP client", () => {
     ]);
   });
 
+  it("accepts blank worker URLs without losing the primary page target", async () => {
+    const fetchImpl: CdpFetch = async () => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return [
+          {
+            id: "worker-1",
+            type: "worker",
+            title: "Worker",
+            url: "",
+            webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-1",
+          },
+          {
+            id: "page-1",
+            type: "page",
+            title: "Codex",
+            url: "app://-/index.html",
+            webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+          },
+        ];
+      },
+    });
+
+    await expect(listCdpTargets("http://127.0.0.1:9222", fetchImpl)).resolves.toEqual([
+      {
+        id: "worker-1",
+        type: "worker",
+        title: "Worker",
+        url: "",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/worker-1",
+      },
+      {
+        id: "page-1",
+        type: "page",
+        title: "Codex",
+        url: "app://-/index.html",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/page-1",
+      },
+    ]);
+  });
+
   it("validates browser-level discovery metadata", async () => {
     const fetchImpl: CdpFetch = async (url) => ({
       ok: true,
