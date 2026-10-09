@@ -18,6 +18,21 @@ import {
 } from "./renderer-draft-prewarm-policy.js";
 import type { LocalSidecar } from "./local-sidecar.js";
 
+const SIDECAR_BINDING_NAME = "__harnessmixSidecarSendV1";
+const SIDECAR_PROBE_KEY = "__harnessmixControllerBindingProbeV1";
+const MAX_SIDECAR_PROBE_TIMEOUT_MS = 2_000;
+let sidecarProbeSequence = 0;
+
+function recoverPendingApprovals(renderer: RendererConnection): void {
+  void renderer
+    .command("Runtime.evaluate", {
+      expression:
+        "window.__harnessmixSidecarRequestV1?.recoverPendingApprovals?.() ?? 0",
+      returnByValue: true,
+    })
+    .catch(() => undefined);
+}
+
 export interface ProductionRendererStatus {
   version: 2;
   enabledAgents: string[];
@@ -211,7 +226,158 @@ async function waitForBinding(
 interface InstalledTarget {
   renderer: RendererConnection;
   snapshot: RendererCdpControlSnapshot;
-  detachSidecar?: () => void;
+  sidecarRelay?: SidecarBindingRelay;
+}
+
+interface SidecarBindingRelay {
+  activate(): void;
+  close(): void;
+  deactivate(): void;
+  probe(): Promise<void>;
+  reinstallBinding(): Promise<void>;
+}
+
+interface PendingSidecarProbe {
+  reject(error: Error): void;
+  resolve(): void;
+}
+
+function readSidecarProbeId(payload: string): string | null | undefined {
+  try {
+    const value: unknown = JSON.parse(payload);
+    if (!isRecord(value) || !(SIDECAR_PROBE_KEY in value)) return undefined;
+    const probe = value[SIDECAR_PROBE_KEY];
+    return isRecord(probe) && probe.version === 1 && typeof probe.id === "string"
+      ? probe.id
+      : null;
+  } catch {
+    return undefined;
+  }
+}
+
+function createSidecarBindingRelay(
+  renderer: RendererConnection,
+  sidecar: LocalSidecar,
+  probeTimeoutMs: number,
+): SidecarBindingRelay {
+  if (!renderer.on) throw new Error("Renderer CDP binding events are unavailable");
+  const pendingProbes = new Map<string, PendingSidecarProbe>();
+  let active = false;
+  let closed = false;
+  let detachSidecar: (() => void) | undefined;
+  const deliverSidecarFrame = (frame: string): void => {
+    const payload = JSON.stringify(frame);
+    void renderer
+      .command("Runtime.evaluate", {
+        expression: `(() => { const frame = ${payload}; if (typeof window.__harnessmixSidecarReceiveV1 === "function") window.__harnessmixSidecarReceiveV1(frame); else (window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame); })()`,
+      })
+      .catch(() => undefined);
+  };
+  const detachBinding = renderer.on("Runtime.bindingCalled", (params) => {
+    if (
+      !isRecord(params) ||
+      params.name !== SIDECAR_BINDING_NAME ||
+      typeof params.payload !== "string"
+    ) {
+      return;
+    }
+    const probeId = readSidecarProbeId(params.payload);
+    if (probeId !== undefined) {
+      if (probeId !== null) pendingProbes.get(probeId)?.resolve();
+      return;
+    }
+    if (!active || closed) return;
+    try {
+      sidecar.send(params.payload);
+    } catch (error) {
+      deliverSidecarFrame(JSON.stringify({ harnessmixSidecarFailure: String(error) }));
+    }
+  });
+  const deactivate = (): void => {
+    active = false;
+    detachSidecar?.();
+    detachSidecar = undefined;
+  };
+  return {
+    activate() {
+      if (closed || active) return;
+      active = true;
+      detachSidecar = sidecar.onFrame(deliverSidecarFrame);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      deactivate();
+      detachBinding();
+      for (const probe of pendingProbes.values()) {
+        probe.reject(new Error("Renderer CDP sidecar relay is closed"));
+      }
+      pendingProbes.clear();
+    },
+    deactivate,
+    async probe() {
+      if (closed) throw new Error("Renderer CDP sidecar relay is closed");
+      const id = `${Date.now().toString(36)}-${(++sidecarProbeSequence).toString(36)}`;
+      const envelope = JSON.stringify({
+        [SIDECAR_PROBE_KEY]: { version: 1, id },
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const ack = new Promise<void>((resolve, reject) => {
+        pendingProbes.set(id, {
+          reject(error) {
+            pendingProbes.delete(id);
+            if (timer) clearTimeout(timer);
+            reject(error);
+          },
+          resolve() {
+            pendingProbes.delete(id);
+            if (timer) clearTimeout(timer);
+            resolve();
+          },
+        });
+        timer = setTimeout(() => {
+          pendingProbes
+            .get(id)
+            ?.reject(new Error("Renderer CDP sidecar binding probe timed out"));
+        }, probeTimeoutMs);
+      });
+      try {
+        void renderer
+          .command("Runtime.evaluate", {
+            expression: `window.${SIDECAR_BINDING_NAME}(JSON.stringify(${envelope}))`,
+            awaitPromise: true,
+          })
+          .then((response) => {
+            if (!isRecord(response)) {
+              throw new Error("Renderer CDP sidecar binding probe returned an invalid result");
+            }
+            if (isRecord(response.exceptionDetails)) {
+              throw new Error(
+                typeof response.exceptionDetails.text === "string"
+                  ? response.exceptionDetails.text
+                  : "Renderer CDP sidecar binding probe failed",
+              );
+            }
+          })
+          .catch((error: unknown) => {
+            pendingProbes
+              .get(id)
+              ?.reject(error instanceof Error ? error : new Error(String(error)));
+          });
+        await ack;
+      } catch (error) {
+        pendingProbes.delete(id);
+        if (timer) clearTimeout(timer);
+        throw error;
+      }
+    },
+    async reinstallBinding() {
+      await renderer
+        .command("Runtime.removeBinding", { name: SIDECAR_BINDING_NAME })
+        .catch(() => undefined);
+      await renderer.command("Runtime.addBinding", { name: SIDECAR_BINDING_NAME });
+    },
+  };
 }
 
 async function installTarget(
@@ -222,47 +388,22 @@ async function installTarget(
   timeoutMs: number,
   pollIntervalMs: number,
   operations: CdpOperations,
+  onSidecarRelayReady?: (relay: SidecarBindingRelay) => void,
 ): Promise<InstalledTarget> {
   const renderer = await operations.connect(target.webSocketDebuggerUrl);
-  let detachSidecar: (() => void) | undefined;
-  // 帧中继与桥安装存在竞态：CDP attach 早于请求管理器 patch，
-  // __harnessmixSidecarReceiveV1 尚未定义，optional-chain 会把这段窗口里
-  // （含 sidecar 帧缓冲重放的 Host 启动补发）整批帧静默丢弃。先停进页面级
-  // 停机坪，桥安装时统一按序放行。
-  const deliverSidecarFrame = (frame: string): void => {
-    const payload = JSON.stringify(frame);
-    void renderer
-      .command("Runtime.evaluate", {
-        expression: `(() => { const frame = ${payload}; if (typeof window.__harnessmixSidecarReceiveV1 === "function") window.__harnessmixSidecarReceiveV1(frame); else (window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame); })()`,
-      })
-      .catch(() => undefined);
-  };
+  let sidecarRelay: SidecarBindingRelay | undefined;
   try {
     await renderer.command("Runtime.enable");
     await renderer.command("Page.enable");
     if (sidecar) {
-      if (!renderer.on) throw new Error("Renderer CDP binding events are unavailable");
-      await renderer
-        .command("Runtime.removeBinding", { name: "__harnessmixSidecarSendV1" })
-        .catch(() => undefined);
-      await renderer.command("Runtime.addBinding", { name: "__harnessmixSidecarSendV1" });
-      renderer.on("Runtime.bindingCalled", (params) => {
-        if (
-          !isRecord(params) ||
-          params.name !== "__harnessmixSidecarSendV1" ||
-          typeof params.payload !== "string"
-        ) {
-          return;
-        }
-        try {
-          sidecar.send(params.payload);
-        } catch (error) {
-          deliverSidecarFrame(JSON.stringify({ harnessmixSidecarFailure: String(error) }));
-        }
-      });
-      detachSidecar = sidecar.onFrame((frame) => {
-        deliverSidecarFrame(frame);
-      });
+      sidecarRelay = createSidecarBindingRelay(
+        renderer,
+        sidecar,
+        Math.min(MAX_SIDECAR_PROBE_TIMEOUT_MS, Math.max(25, pollIntervalMs * 8)),
+      );
+      await sidecarRelay.reinstallBinding();
+      await sidecarRelay.probe();
+      onSidecarRelayReady?.(sidecarRelay);
     }
     await renderer.command("Page.addScriptToEvaluateOnNewDocument", { source: rendererSource });
     await evaluateSource(renderer, rendererSource);
@@ -271,10 +412,10 @@ async function installTarget(
     return {
       renderer,
       snapshot: { target, draftPrewarmPolicy, binding },
-      ...(detachSidecar ? { detachSidecar } : {}),
+      ...(sidecarRelay ? { sidecarRelay } : {}),
     };
   } catch (error) {
-    detachSidecar?.();
+    sidecarRelay?.close();
     renderer.close();
     throw error;
   }
@@ -284,7 +425,9 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
   #closed = false;
   #renderer: RendererConnection;
   #snapshot: RendererCdpControlSnapshot;
-  #detachSidecar: (() => void) | undefined;
+  #sidecarRelay: SidecarBindingRelay | undefined;
+  #pendingReplacementRelay: SidecarBindingRelay | undefined;
+  #lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly endpoint: string,
@@ -298,14 +441,23 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
   ) {
     this.#renderer = installed.renderer;
     this.#snapshot = installed.snapshot;
-    this.#detachSidecar = installed.detachSidecar;
+    this.#sidecarRelay = installed.sidecarRelay;
   }
 
   get snapshot(): RendererCdpControlSnapshot {
     return this.#snapshot;
   }
 
-  async ensureInstalled(): Promise<RendererCdpControlSnapshot> {
+  ensureInstalled(): Promise<RendererCdpControlSnapshot> {
+    const operation = this.#lifecycleTail.then(() => this.#ensureInstalledOnce());
+    this.#lifecycleTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  async #ensureInstalledOnce(): Promise<RendererCdpControlSnapshot> {
     if (this.#closed) throw new Error("Renderer CDP Control Session is closed");
     const target = await waitForPrimaryTarget(
       this.endpoint,
@@ -319,6 +471,15 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
       return this.#snapshot;
     }
     try {
+      if (this.#sidecarRelay) {
+        try {
+          await this.#sidecarRelay.probe();
+        } catch {
+          await this.#sidecarRelay.reinstallBinding();
+          await this.#sidecarRelay.probe();
+          recoverPendingApprovals(this.#renderer);
+        }
+      }
       const existing = await readBinding(this.#renderer);
       if (existing === null) await evaluateSource(this.#renderer, this.rendererSource);
       else validateBindingStatus(existing, this.enabledAgents);
@@ -332,6 +493,7 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
       this.#snapshot = { target, draftPrewarmPolicy, binding };
       return this.#snapshot;
     } catch {
+      if (this.#closed) throw new Error("Renderer CDP Control Session is closed");
       await this.#reinstall(target);
       return this.#snapshot;
     }
@@ -353,25 +515,50 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#detachSidecar?.();
+    this.#pendingReplacementRelay?.close();
+    this.#pendingReplacementRelay = undefined;
+    this.#sidecarRelay?.close();
     this.#renderer.close();
   }
 
   async #reinstall(target: CdpTarget): Promise<void> {
-    const replacement = await installTarget(
-      target,
-      this.rendererSource,
-      this.sidecar,
-      this.enabledAgents,
-      this.timeoutMs,
-      this.pollIntervalMs,
-      this.operations,
-    );
-    this.#detachSidecar?.();
+    const previousRelay = this.#sidecarRelay;
+    let relayHandedOff = false;
+    let replacement: InstalledTarget;
+    try {
+      replacement = await installTarget(
+        target,
+        this.rendererSource,
+        this.sidecar,
+        this.enabledAgents,
+        this.timeoutMs,
+        this.pollIntervalMs,
+        this.operations,
+        (relay) => {
+          if (this.#closed) throw new Error("Renderer CDP Control Session is closed");
+          this.#pendingReplacementRelay = relay;
+          previousRelay?.deactivate();
+          relayHandedOff = true;
+          relay.activate();
+        },
+      );
+    } catch (error) {
+      this.#pendingReplacementRelay = undefined;
+      if (relayHandedOff && !this.#closed) previousRelay?.activate();
+      throw error;
+    }
+    this.#pendingReplacementRelay = undefined;
+    if (this.#closed) {
+      replacement.sidecarRelay?.close();
+      replacement.renderer.close();
+      throw new Error("Renderer CDP Control Session is closed");
+    }
+    previousRelay?.close();
     this.#renderer.close();
     this.#renderer = replacement.renderer;
-    this.#detachSidecar = replacement.detachSidecar;
+    this.#sidecarRelay = replacement.sidecarRelay;
     this.#snapshot = replacement.snapshot;
+    if (replacement.sidecarRelay) recoverPendingApprovals(replacement.renderer);
   }
 }
 
@@ -402,6 +589,7 @@ export async function createRendererCdpControlSession(
     timeoutMs,
     pollIntervalMs,
     operations,
+    (relay) => relay.activate(),
   );
   return new ActiveRendererCdpControlSession(
     options.rendererCdpEndpoint,

@@ -207,8 +207,11 @@ export class CdpClient {
     this.#socket = socket;
     this.#commandTimeoutMs = commandTimeoutMs;
     socket.addEventListener("message", (event) => this.#dispatch(event));
-    socket.addEventListener("error", () => this.#rejectAll(new Error("CDP WebSocket failed")));
-    socket.addEventListener("close", () => this.#rejectAll(new Error("CDP WebSocket closed")));
+    socket.addEventListener("error", () => {
+      this.#terminate(new Error("CDP WebSocket failed"));
+      socket.close();
+    });
+    socket.addEventListener("close", () => this.#terminate(new Error("CDP WebSocket closed")));
   }
 
   static async connect(url: string, options: CdpClientOptions = {}): Promise<CdpClient> {
@@ -285,10 +288,15 @@ export class CdpClient {
 
   close(): void {
     if (this.#closed) return;
-    this.#closed = true;
-    this.#rejectAll(new Error("CDP client closed"));
-    this.#listeners.clear();
+    this.#terminate(new Error("CDP client closed"));
     this.#socket.close();
+  }
+
+  #terminate(error: Error): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#rejectAll(error);
+    this.#listeners.clear();
   }
 
   #request(

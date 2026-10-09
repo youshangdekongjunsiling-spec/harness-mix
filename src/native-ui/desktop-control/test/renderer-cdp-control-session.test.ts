@@ -26,23 +26,59 @@ function readyBinding() {
 
 function rendererClient(binding = readyBinding()) {
   const commands: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  const bindingListeners = new Set<(params: unknown) => void>();
+  let bindingLive = true;
   const evaluateSpy = vi.fn(async (expression: string) => {
     void expression;
     return binding as unknown;
   });
-  return {
+  const client = {
     commands,
     evaluateSpy,
     command: vi.fn(async (method: string, params?: Record<string, unknown>) => {
       commands.push({ method, ...(params ? { params } : {}) });
+      if (method === "Runtime.removeBinding") bindingLive = false;
+      if (method === "Runtime.addBinding") bindingLive = true;
+      if (
+        method === "Runtime.evaluate" &&
+        bindingLive &&
+        typeof params?.expression === "string" &&
+        params.expression.includes("__harnessmixControllerBindingProbeV1")
+      ) {
+        const id = params.expression.match(/"id":"([^"]+)"/)?.[1];
+        if (id) {
+          const payload = JSON.stringify({
+            __harnessmixControllerBindingProbeV1: { version: 1, id },
+          });
+          for (const listener of bindingListeners) {
+            listener({ name: "__harnessmixSidecarSendV1", payload });
+          }
+        }
+      }
       if (method === "Runtime.evaluate") return { result: { type: "undefined" } };
       return {};
     }),
     async evaluate<T>(expression: string): Promise<T> {
       return (await evaluateSpy(expression)) as T;
     },
+    on: vi.fn((method: string, listener: (params: unknown) => void) => {
+      if (method === "Runtime.bindingCalled") bindingListeners.add(listener);
+      return () => bindingListeners.delete(listener);
+    }),
+    emitBinding(payload: string) {
+      for (const listener of bindingListeners) {
+        listener({ name: "__harnessmixSidecarSendV1", payload });
+      }
+    },
+    setBindingLive(value: boolean) {
+      bindingLive = value;
+    },
+    bindingListenerCount() {
+      return bindingListeners.size;
+    },
     close: vi.fn(),
   };
+  return client;
 }
 
 describe("Renderer CDP Control Session", () => {
@@ -97,13 +133,6 @@ describe("Renderer CDP Control Session", () => {
 
   it("carries explicitly routed Host frames over a separate CDP binding", async () => {
     const client = rendererClient();
-    let bindingCalled: ((params: unknown) => void) | undefined;
-    Object.assign(client, {
-      on: vi.fn((method: string, listener: (params: unknown) => void) => {
-        if (method === "Runtime.bindingCalled") bindingCalled = listener;
-        return () => undefined;
-      }),
-    });
     let output: ((frame: string) => void) | undefined;
     const sidecar = {
       send: vi.fn(),
@@ -134,7 +163,7 @@ describe("Renderer CDP Control Session", () => {
     expect(client.commands[3]).toEqual({
       method: "Runtime.addBinding", params: { name: "__harnessmixSidecarSendV1" },
     });
-    bindingCalled?.({ name: "__harnessmixSidecarSendV1", payload: '{"id":1,"method":"harnessmix/thread/list"}' });
+    client.emitBinding('{"id":1,"method":"harnessmix/thread/list"}');
     expect(sidecar.send).toHaveBeenCalledWith('{"id":1,"method":"harnessmix/thread/list"}');
     output?.('{"id":1,"result":{"data":[]}}');
     expect(client.command).toHaveBeenCalledWith("Runtime.evaluate", {
@@ -148,12 +177,6 @@ describe("Renderer CDP Control Session", () => {
 
   it("parks Host frames when the bridge receive handler is not installed yet", async () => {
     const client = rendererClient();
-    Object.assign(client, {
-      on: vi.fn((method: string, listener: (params: unknown) => void) => {
-        void method; void listener;
-        return () => undefined;
-      }),
-    });
     let output: ((frame: string) => void) | undefined;
     const sidecar = {
       send: vi.fn(),
@@ -186,6 +209,163 @@ describe("Renderer CDP Control Session", () => {
     // 停机坪表达式在 receive 未装好时把帧推入页面级队列而不是丢弃
     expect(relay?.params.expression).toContain('if (typeof window.__harnessmixSidecarReceiveV1 === "function")');
     expect(relay?.params.expression).toContain("(window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame)");
+    session.close();
+  });
+
+  it("repairs a dead outbound binding even when renderer readiness remains healthy", async () => {
+    const client = rendererClient();
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    };
+    const connect = vi.fn(async () => client);
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      sidecar,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect,
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+
+    client.setBindingLive(false);
+    await expect(session.ensureInstalled()).resolves.toMatchObject({ target: { id: "page-1" } });
+    expect(connect).toHaveBeenCalledOnce();
+    expect(client.commands.filter(({ method }) => method === "Runtime.addBinding")).toHaveLength(2);
+    expect(client.on).toHaveBeenCalledOnce();
+    expect(sidecar.send).not.toHaveBeenCalled();
+    expect(
+      client.commands.filter(({ params }) =>
+        String(params?.expression).includes("recoverPendingApprovals"),
+      ),
+    ).toHaveLength(1);
+    session.close();
+  });
+
+  it("fails within the probe deadline when binding events have no live listener", async () => {
+    const client = rendererClient();
+    client.on.mockImplementation(() => () => undefined);
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    };
+
+    await expect(
+      createRendererCdpControlSession({
+        rendererCdpEndpoint: "http://127.0.0.1:43123",
+        rendererSource: "production renderer",
+        sidecar,
+        pollIntervalMs: 1,
+        timeoutMs: 5_000,
+        operations: {
+          listTargets: vi.fn(async () => [target("page-1")]),
+          connect: vi.fn(async () => client),
+          installDraftPrewarmPolicy: vi.fn(async () => ({
+            state: "ready" as const,
+            reason: "owned-request-bridge" as const,
+          })),
+        },
+      }),
+    ).rejects.toThrow("Renderer CDP sidecar binding probe timed out");
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(sidecar.send).not.toHaveBeenCalled();
+  });
+
+  it("keeps healthy liveness checks on one listener and consumes probes locally", async () => {
+    const client = rendererClient();
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    };
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      sidecar,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect: vi.fn(async () => client),
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+
+    await Promise.all([session.ensureInstalled(), session.ensureInstalled()]);
+    expect(client.on).toHaveBeenCalledOnce();
+    expect(client.bindingListenerCount()).toBe(1);
+    expect(client.commands.filter(({ method }) => method === "Runtime.addBinding")).toHaveLength(1);
+    expect(sidecar.send).not.toHaveBeenCalled();
+    expect(
+      client.commands.filter(({ params }) =>
+        String(params?.expression).includes("recoverPendingApprovals"),
+      ),
+    ).toHaveLength(0);
+    session.close();
+    expect(client.bindingListenerCount()).toBe(0);
+  });
+
+  it("hands replacement relay ownership over without duplicate forwarding", async () => {
+    const first = rendererClient();
+    const replacement = rendererClient();
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn(() => () => undefined),
+      close: vi.fn(),
+    };
+    let inventory = [target("page-1")];
+    let releaseReplacement: (() => void) | undefined;
+    const replacementReady = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    let installs = 0;
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      sidecar,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => inventory),
+        connect: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(replacement),
+        installDraftPrewarmPolicy: vi.fn(async () => {
+          installs += 1;
+          if (installs === 2) await replacementReady;
+          return { state: "ready" as const, reason: "owned-request-bridge" as const };
+        }),
+      },
+    });
+
+    inventory = [target("page-2")];
+    const replacing = session.ensureInstalled();
+    await vi.waitFor(() => expect(replacement.bindingListenerCount()).toBe(1));
+    const request = '{"id":7,"method":"harnessmix/thread/list"}';
+    first.emitBinding(request);
+    replacement.emitBinding(request);
+    expect(sidecar.send).toHaveBeenCalledTimes(1);
+    releaseReplacement?.();
+    await replacing;
+    first.emitBinding(request);
+    replacement.emitBinding(request);
+    expect(sidecar.send).toHaveBeenCalledTimes(2);
+    expect(first.bindingListenerCount()).toBe(0);
+    expect(
+      replacement.commands.filter(({ params }) =>
+        String(params?.expression).includes("recoverPendingApprovals"),
+      ),
+    ).toHaveLength(1);
     session.close();
   });
 

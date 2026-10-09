@@ -16,6 +16,7 @@ type SocketListener = (event: SocketEvent) => void;
 
 class FakeSocket {
   readonly requests: Array<{ id: number; method: string; sessionId?: string }> = [];
+  closeCalls = 0;
   readonly #listeners = new Map<string, Set<SocketListener>>();
 
   constructor() {
@@ -55,7 +56,12 @@ class FakeSocket {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.#emit("close", {});
+  }
+
+  disconnect(type: "close" | "error" = "close"): void {
+    this.#emit(type, {});
   }
 
   #emit(type: string, event: SocketEvent): void {
@@ -195,5 +201,33 @@ describe("CDP client", () => {
     });
     expect(socket.requests.at(-1)?.sessionId).toBe("session-1");
     client.close();
+  });
+
+  it("treats a remote socket close as terminal for pending and future commands", async () => {
+    const socket = new FakeSocket();
+    const client = await CdpClient.connect("ws://127.0.0.1:9222/devtools/page/page-1", {
+      commandTimeoutMs: 10_000,
+      socketFactory: () => socket,
+    });
+
+    const pending = client.command("Runtime.enable");
+    socket.disconnect();
+    await expect(pending).rejects.toThrow("CDP WebSocket closed");
+    const requestsAfterClose = socket.requests.length;
+    await expect(client.command("Page.enable")).rejects.toThrow("CDP client is closed");
+    expect(socket.requests).toHaveLength(requestsAfterClose);
+  });
+
+  it("physically closes a socket after a remote error marks the client terminal", async () => {
+    const socket = new FakeSocket();
+    const client = await CdpClient.connect("ws://127.0.0.1:9222/devtools/page/page-1", {
+      socketFactory: () => socket,
+    });
+
+    socket.disconnect("error");
+    expect(socket.closeCalls).toBe(1);
+    await expect(client.command("Runtime.enable")).rejects.toThrow("CDP client is closed");
+    client.close();
+    expect(socket.closeCalls).toBe(1);
   });
 });

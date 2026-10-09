@@ -135,6 +135,8 @@ export function installDraftPrewarmPolicyBridge(
   }
   const knownExternalThreadIds = new Set<string>();
   const knownOfficialThreadIds = new Set<string>();
+  const hydratedExternalThreadIds = new Set<string>();
+  const hydrationReadsInFlight = new Set<string>();
   const externalThreadTitles = new Map<string, string>();
   const nativeHistorySyncNotices = new Map<
     string,
@@ -209,7 +211,27 @@ export function installDraftPrewarmPolicyBridge(
     }`;
   let bridgeProcessHandle = createBridgeProcessHandle();
   const bridgeReadyMethod = "harnessmix/remote-control-bridge/ready";
-  const bridgeRequests = new Map<unknown, { method: string; parameters: unknown }>();
+  // Bound requests after they have entered the Harness Mix transport. This is
+  // deliberately a settlement timeout, not a retry: replaying thread/start,
+  // turn/start or another mutation after an uncertain delivery would duplicate
+  // native work. Timing out through bridge.onError also releases Desktop's own
+  // request registry instead of leaving every later composer request wedged.
+  const quickReadOnlyRequestTimeoutMs = 20_000;
+  const defaultRequestTimeoutMs = 120_000;
+  const quickReadOnlyBridgeMethods = new Set([
+    "harnessmix/harness/inspect",
+    "harnessmix/thread/inspect",
+    "harnessmix/thread/list",
+    "harnessmix/thread/ownership/list",
+    "harnessmix/update/check",
+    "initialize",
+  ]);
+  const bridgeRequests = new Map<unknown, {
+    method: string;
+    parameters: unknown;
+    startedAt: number;
+    timer: ReturnType<typeof globalThis.setTimeout>;
+  }>();
   const bridgeServerRequestIdPrefix = "harnessmix/remote-control-bridge/server-request/";
   const bridgeServerRequests = new Map<string, unknown>();
   let nextBridgeServerRequestOrdinal = 1;
@@ -225,6 +247,56 @@ export function installDraftPrewarmPolicyBridge(
   let bridgeReadyTimeout: ReturnType<typeof globalThis.setTimeout> | null = null;
   let bridgeInitialization: Promise<void> | null = null;
   let writeTail = Promise.resolve();
+  let pendingWrites = 0;
+  let lastWriteStartedAt: number | null = null;
+  let lastWriteSettledAt: number | null = null;
+  let lastResponseAt: number | null = null;
+  let lastTransportError: string | null = null;
+
+  const transportDiagnostics = () => {
+    const now = Date.now();
+    let oldestPendingAt: number | null = null;
+    for (const request of bridgeRequests.values()) {
+      if (oldestPendingAt === null || request.startedAt < oldestPendingAt) {
+        oldestPendingAt = request.startedAt;
+      }
+    }
+    return {
+      version: 1,
+      hostId,
+      mode: isLocalSidecarHost ? "local-sidecar" : isRemoteControlHost ? "remote-control" : "direct",
+      bridgeState,
+      pendingRequestCount: bridgeRequests.size,
+      oldestPendingAgeMs: oldestPendingAt === null ? null : Math.max(0, now - oldestPendingAt),
+      pendingWrites,
+      lastWriteStartedAt,
+      lastWriteSettledAt,
+      lastResponseAt,
+      lastTransportError,
+    };
+  };
+
+  const takeBridgeRequest = (requestId: unknown) => {
+    const request = bridgeRequests.get(requestId);
+    if (!request) return undefined;
+    bridgeRequests.delete(requestId);
+    globalThis.clearTimeout(request.timer);
+    return request;
+  };
+
+  const bridgeRequestTimeoutMs = (method: string, options: unknown): number => {
+    if (
+      isRecord(options) &&
+      typeof options.timeoutMs === "number" &&
+      Number.isFinite(options.timeoutMs) &&
+      options.timeoutMs > 0
+    ) {
+      return options.timeoutMs;
+    }
+    return quickReadOnlyBridgeMethods.has(method)
+      ? quickReadOnlyRequestTimeoutMs
+      : defaultRequestTimeoutMs;
+  };
 
   const transportError = (message: string, cause?: unknown): Error => {
     const error = new Error(`harnessmix Remote Control bridge: ${message}`);
@@ -259,11 +331,16 @@ export function installDraftPrewarmPolicyBridge(
       `${cause instanceof Error ? cause.message : String(cause)}${stderr ? `; ${stderr}` : ""}`,
       cause,
     );
+    // Public diagnostics stay categorical: stderr/cause text can contain
+    // native command details and must not be reflected into the page.
+    lastTransportError = "bridge-failed";
     bridgeReadyReject?.(error);
     bridgeReadyReject = null;
     bridgeReadyResolve = null;
-    for (const requestId of bridgeRequests.keys()) bridge.onError(requestId, error);
-    bridgeRequests.clear();
+    for (const requestId of [...bridgeRequests.keys()]) {
+      takeBridgeRequest(requestId);
+      bridge.onError(requestId, error);
+    }
     if (isRemoteControlHost && terminate) {
       void Promise.resolve(
         originalSend.call(bridge, "process/kill", { processHandle: failedProcessHandle }),
@@ -398,11 +475,22 @@ export function installDraftPrewarmPolicyBridge(
       typeof request.parameters.threadId === "string"
     ) {
       if (result.owner === "external") {
-        knownExternalThreadIds.add(request.parameters.threadId);
-        knownOfficialThreadIds.delete(request.parameters.threadId);
+        const threadId = request.parameters.threadId;
+        knownExternalThreadIds.add(threadId);
+        knownOfficialThreadIds.delete(threadId);
+        if (!hydratedExternalThreadIds.has(threadId)) {
+          // A newly installed Renderer bridge has no live request state from
+          // the previous CDP binding. One read asks the Host to replay its
+          // existing live-only pending approvals without replaying a turn or
+          // mutation. Mark before dispatch so repeated inspect responses and
+          // the read result itself cannot form a loop.
+          hydratedExternalThreadIds.add(threadId);
+          scheduleExternalThreadHydration(threadId);
+        }
       } else if (result.owner === "codex") {
         knownOfficialThreadIds.add(request.parameters.threadId);
         knownExternalThreadIds.delete(request.parameters.threadId);
+        hydratedExternalThreadIds.delete(request.parameters.threadId);
       }
       return;
     }
@@ -413,6 +501,7 @@ export function installDraftPrewarmPolicyBridge(
     ) {
       knownExternalThreadIds.delete(request.parameters.threadId);
       knownOfficialThreadIds.delete(request.parameters.threadId);
+      hydratedExternalThreadIds.delete(request.parameters.threadId);
       externalThreadTitles.delete(request.parameters.threadId);
       nativeHistorySyncNotices.delete(request.parameters.threadId);
       if (nativeHistorySyncDismissals.delete(request.parameters.threadId)) {
@@ -482,9 +571,21 @@ export function installDraftPrewarmPolicyBridge(
       return;
     }
     if (typeof value.method === "string" && value.id !== undefined) {
-      const outerRequestId = `${bridgeServerRequestIdPrefix}${bridgeProcessHandle}/${nextBridgeServerRequestOrdinal}`;
-      nextBridgeServerRequestOrdinal += 1;
-      bridgeServerRequests.set(outerRequestId, value.id);
+      let outerRequestId: string | undefined;
+      for (const [candidateOuterId, candidateInnerId] of bridgeServerRequests) {
+        if (candidateInnerId === value.id) {
+          outerRequestId = candidateOuterId;
+          break;
+        }
+      }
+      if (outerRequestId === undefined) {
+        outerRequestId = `${bridgeServerRequestIdPrefix}${bridgeProcessHandle}/${nextBridgeServerRequestOrdinal}`;
+        nextBridgeServerRequestOrdinal += 1;
+        bridgeServerRequests.set(outerRequestId, value.id);
+      }
+      // Re-dispatch repeated native approvals so a repaired Renderer can
+      // restore a lost card, but keep the same Desktop-facing id and response
+      // mapping until the user answers it.
       manager.onRequest({ ...value, id: outerRequestId });
       return;
     }
@@ -492,8 +593,8 @@ export function installDraftPrewarmPolicyBridge(
       failBridge("received an app-server response without an id");
       return;
     }
-    const request = bridgeRequests.get(value.id);
-    bridgeRequests.delete(value.id);
+    const request = takeBridgeRequest(value.id);
+    lastResponseAt = Date.now();
     if ("error" in value) {
       bridge.onError(value.id, value.error, value.metrics);
       return;
@@ -621,9 +722,15 @@ export function installDraftPrewarmPolicyBridge(
     }
     return bridgeReadyPromise;
   };
-  const writeBridgeFrame = (value: Record<string, unknown>): Promise<void> => {
+  const writeBridgeFrame = (
+    value: Record<string, unknown>,
+    isCurrent?: () => boolean,
+  ): Promise<void> => {
     const operation = async (): Promise<void> => {
+      if (isCurrent && !isCurrent()) return;
+      lastWriteStartedAt = Date.now();
       await startBridge();
+      if (isCurrent && !isCurrent()) return;
       if (bridgeState !== "ready") throw transportError("is not ready");
       if (isLocalSidecarHost) {
         (target.__harnessmixSidecarSendV1 as (frame: string) => void)(JSON.stringify(value));
@@ -634,15 +741,84 @@ export function installDraftPrewarmPolicyBridge(
         deltaBase64: utf8Base64(`${JSON.stringify(value)}\n`),
       });
     };
+    pendingWrites += 1;
     const next = writeTail.then(operation, operation);
-    writeTail = next.catch(() => undefined);
+    const settled = next.then(
+      () => { pendingWrites = Math.max(0, pendingWrites - 1); lastWriteSettledAt = Date.now(); },
+      (error) => {
+        pendingWrites = Math.max(0, pendingWrites - 1);
+        lastWriteSettledAt = Date.now();
+        lastTransportError = "write-failed";
+      },
+    );
+    writeTail = settled.then(() => undefined, () => undefined);
     return next;
   };
   const enqueueBridgeRequest = (method: string, parameters: unknown, options?: unknown): unknown =>
     bridge.enqueueRequest(method, parameters, options, (request) => {
-      bridgeRequests.set(request.id, { method, parameters });
-      void writeBridgeFrame(request).catch((error) => failBridge(error));
+      const startedAt = Date.now();
+      const timeoutMs = bridgeRequestTimeoutMs(method, options);
+      const completionUnknown = !quickReadOnlyBridgeMethods.has(method);
+      const tracked: {
+        method: string;
+        parameters: unknown;
+        startedAt: number;
+        timer: ReturnType<typeof globalThis.setTimeout>;
+      } = {
+        method,
+        parameters,
+        startedAt,
+        timer: globalThis.setTimeout(() => {
+          if (bridgeRequests.get(request.id) !== tracked) return;
+          bridgeRequests.delete(request.id);
+          const error = transportError(
+            `${method} timed out after ${timeoutMs}ms` +
+            (completionUnknown ? "; completion is unknown; request was not replayed" : ""),
+          );
+          lastTransportError = completionUnknown
+            ? "request-timeout-completion-unknown"
+            : "request-timeout";
+          bridge.onError(request.id, error);
+        }, timeoutMs),
+      };
+      bridgeRequests.set(request.id, tracked);
+      void writeBridgeFrame(
+        request,
+        () => bridgeRequests.get(request.id) === tracked && bridgeState !== "disposed",
+      ).catch((error) => failBridge(error));
     });
+  const scheduleExternalThreadHydration = (threadId: string): boolean => {
+    if (
+      !hydratedExternalThreadIds.has(threadId) ||
+      !knownExternalThreadIds.has(threadId) ||
+      knownOfficialThreadIds.has(threadId) ||
+      hydrationReadsInFlight.has(threadId) ||
+      bridgeState === "disposed"
+    ) {
+      return false;
+    }
+    hydrationReadsInFlight.add(threadId);
+    try {
+      const hydration = enqueueBridgeRequest("thread/read", {
+        threadId,
+        includeTurns: false,
+      }) as Promise<unknown>;
+      void Promise.resolve(hydration)
+        .catch(() => undefined)
+        .finally(() => hydrationReadsInFlight.delete(threadId));
+      return true;
+    } catch {
+      hydrationReadsInFlight.delete(threadId);
+      return false;
+    }
+  };
+  const recoverPendingApprovals = (): number => {
+    let scheduled = 0;
+    for (const threadId of hydratedExternalThreadIds) {
+      if (scheduleExternalThreadHydration(threadId)) scheduled += 1;
+    }
+    return scheduled;
+  };
   const initializeBridgeProtocol = (): Promise<unknown> => {
     const initialization = enqueueBridgeRequest("initialize", {
       clientInfo: {
@@ -1084,11 +1260,16 @@ export function installDraftPrewarmPolicyBridge(
       bridgeState = "disposed";
       const disposedError = transportError("was disposed");
       bridgeReadyReject?.(disposedError);
-      for (const requestId of bridgeRequests.keys()) bridge.onError(requestId, disposedError);
-      bridgeRequests.clear();
+      lastTransportError = "disposed";
+      for (const requestId of [...bridgeRequests.keys()]) {
+        takeBridgeRequest(requestId);
+        bridge.onError(requestId, disposedError);
+      }
       bridgeServerRequests.clear();
       knownExternalThreadIds.clear();
       knownOfficialThreadIds.clear();
+      hydratedExternalThreadIds.clear();
+      hydrationReadsInFlight.clear();
       externalThreadTitles.clear();
       nativeHistorySyncNotices.clear();
       threadOwnershipResolutions.clear();
@@ -1121,6 +1302,8 @@ export function installDraftPrewarmPolicyBridge(
     configurable: true,
     value: {
       hostId,
+      diagnostics: transportDiagnostics,
+      recoverPendingApprovals,
       send(method: unknown, parameters: unknown): Promise<unknown> {
         if (typeof method !== "string" || !method.startsWith("harnessmix/")) {
           return Promise.reject(

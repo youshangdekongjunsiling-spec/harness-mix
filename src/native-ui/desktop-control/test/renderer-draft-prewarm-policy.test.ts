@@ -94,6 +94,7 @@ describe("Desktop connection snapshot discovery", () => {
     });
     const control = target.__harnessmixSidecarRequestV1 as {
       hostId: string;
+      diagnostics(): { pendingRequestCount: number; pendingWrites: number; lastResponseAt: number | null };
       send(method: string, parameters: unknown): Promise<unknown>;
     };
     expect(control.hostId).toBe("local");
@@ -110,8 +111,213 @@ describe("Desktop connection snapshot discovery", () => {
       JSON.stringify({ id: frame.id, result: { threads: [] } }),
     );
     await expect(pending).resolves.toEqual({ threads: [] });
+    expect(control.diagnostics()).toMatchObject({ pendingRequestCount: 0, pendingWrites: 0 });
+    expect(control.diagnostics().lastResponseAt).not.toBeNull();
     (target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
     expect(target.__harnessmixSidecarRequestV1).toBeUndefined();
+  });
+  it("hydrates each inspected external thread once per installed bridge", async () => {
+    const manager = requestManagerFixture();
+    const frames: Array<{ id: number; method: string; params: unknown }> = [];
+    const pendingById = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+    let nextRequestId = 1;
+    const target: DraftPrewarmPolicyTarget = {
+      __harnessmixSidecarModeV1: true,
+      __harnessmixSidecarSendV1(frame: string) {
+        frames.push(JSON.parse(frame) as { id: number; method: string; params: unknown });
+      },
+    };
+    const bridge = requestBridgeFixture({
+      enqueueRequest(method, parameters, _options, dispatch) {
+        const id = nextRequestId++;
+        const promise = new Promise((resolve, reject) => pendingById.set(id, { resolve, reject }));
+        dispatch({ id, method, params: parameters });
+        return promise;
+      },
+    });
+    bridge.onResult = (id: unknown, result: unknown) => {
+      const pending = pendingById.get(Number(id));
+      pendingById.delete(Number(id));
+      pending?.resolve(result);
+    };
+    bridge.onError = (id: unknown, error: unknown) => {
+      const pending = pendingById.get(Number(id));
+      pendingById.delete(Number(id));
+      pending?.reject(error);
+    };
+    installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+    const control = target.__harnessmixSidecarRequestV1 as {
+      recoverPendingApprovals(): number;
+      send(method: string, parameters: unknown): Promise<unknown>;
+    };
+    const receive = target.__harnessmixSidecarReceiveV1 as (frame: string) => void;
+
+    const firstInspect = control.send("harnessmix/thread/inspect", { threadId: "external-1" });
+    await vi.waitFor(() => expect(frames).toHaveLength(1));
+    receive(JSON.stringify({ id: frames[0]?.id, result: { owner: "external" } }));
+    await expect(firstInspect).resolves.toEqual({ owner: "external" });
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1]).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "external-1", includeTurns: false },
+    });
+    receive(JSON.stringify({ id: frames[1]?.id, result: { thread: { id: "external-1" } } }));
+
+    const repeatedInspect = control.send("harnessmix/thread/inspect", { threadId: "external-1" });
+    await vi.waitFor(() => expect(frames).toHaveLength(3));
+    receive(JSON.stringify({ id: frames[2]?.id, result: { owner: "external" } }));
+    await expect(repeatedInspect).resolves.toEqual({ owner: "external" });
+    expect(frames).toHaveLength(3);
+
+    const officialInspect = control.send("harnessmix/thread/inspect", { threadId: "official-1" });
+    await vi.waitFor(() => expect(frames).toHaveLength(4));
+    receive(JSON.stringify({ id: frames[3]?.id, result: { owner: "codex" } }));
+    await expect(officialInspect).resolves.toEqual({ owner: "codex" });
+    expect(frames).toHaveLength(4);
+
+    expect(control.recoverPendingApprovals()).toBe(1);
+    expect(control.recoverPendingApprovals()).toBe(0);
+    await vi.waitFor(() => expect(frames).toHaveLength(5));
+    expect(frames[4]).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "external-1", includeTurns: false },
+    });
+    expect(frames.some((frame) =>
+      frame.method === "thread/read" &&
+      (frame.params as { threadId?: string }).threadId === "official-1"
+    )).toBe(false);
+    receive(JSON.stringify({ id: frames[4]?.id, result: { thread: { id: "external-1" } } }));
+    await vi.waitFor(() => expect(control.recoverPendingApprovals()).toBe(1));
+    await vi.waitFor(() => expect(frames).toHaveLength(6));
+    receive(JSON.stringify({ id: frames[5]?.id, result: { thread: { id: "external-1" } } }));
+
+    (target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
+  });
+  it("bounds lost sidecar requests without replaying native mutations", async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = requestManagerFixture();
+      const sidecarSend = vi.fn();
+      const target: DraftPrewarmPolicyTarget = {
+        __harnessmixSidecarModeV1: true,
+        __harnessmixSidecarSendV1: sidecarSend,
+      };
+      let nextRequestId = 1;
+      const pendingById = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+      const bridge = requestBridgeFixture({
+        enqueueRequest: (
+          method: string,
+          parameters: unknown,
+          _options: unknown,
+          dispatch: (request: Record<string, unknown>) => void,
+        ) => {
+          const id = nextRequestId++;
+          const promise = new Promise((resolve, reject) => pendingById.set(id, { resolve, reject }));
+          dispatch({ id, method, params: parameters });
+          return promise;
+        },
+      });
+      bridge.onResult = (id: unknown, result: unknown) => {
+        const pending = pendingById.get(Number(id));
+        pendingById.delete(Number(id));
+        pending?.resolve(result);
+      };
+      const onError = vi.fn((id: unknown, error: unknown) => {
+        const pending = pendingById.get(Number(id));
+        pendingById.delete(Number(id));
+        pending?.reject(error);
+      });
+      bridge.onError = onError;
+      installDraftPrewarmPolicyBridge(manager, bridge, "local", target, {
+        discardAllPrewarmedThreads: vi.fn(),
+      });
+      const policy = target.__harnessmixDraftPrewarmPolicyV1 as {
+        select(model: string | null): boolean;
+        dispose(): void;
+      };
+      const control = target.__harnessmixSidecarRequestV1 as {
+        diagnostics(): {
+          bridgeState: string;
+          pendingRequestCount: number;
+          oldestPendingAgeMs: number | null;
+          pendingWrites: number;
+          lastTransportError: string | null;
+        };
+        send(method: string, parameters: unknown): Promise<unknown>;
+      };
+      policy.select("harnessmix/claude-code-native");
+      const start = bridge.sendRequest("thread/start", {
+        cwd: "C:\\workspace",
+        model: "claude-sonnet",
+      }) as Promise<unknown>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sidecarSend).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(sidecarSend.mock.calls[0]?.[0] as string)).toMatchObject({
+        method: "thread/start",
+      });
+      expect(control.diagnostics()).toMatchObject({
+        bridgeState: "ready",
+        pendingRequestCount: 1,
+        pendingWrites: 0,
+      });
+
+      const rejected = expect(start).rejects.toThrow(
+        "thread/start timed out after 120000ms; completion is unknown; request was not replayed",
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(control.diagnostics().pendingRequestCount).toBe(1);
+      expect(onError).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(100_000);
+      await rejected;
+      expect(control.diagnostics().pendingRequestCount).toBe(0);
+      expect(control.diagnostics().oldestPendingAgeMs).toBeNull();
+      expect(control.diagnostics().lastTransportError).toBe("request-timeout-completion-unknown");
+      expect(onError).toHaveBeenCalledTimes(1);
+
+      // A timeout settles the original Desktop request. It never retries an
+      // uncertain mutation or model turn behind the user's back.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sidecarSend).toHaveBeenCalledTimes(1);
+      expect(pendingById.size).toBe(0);
+
+      const inspect = control.send("harnessmix/harness/inspect", {});
+      const inspectRejected = expect(inspect).rejects.toThrow(
+        "harnessmix/harness/inspect timed out after 20000ms",
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+      await inspectRejected;
+      expect(control.diagnostics().lastTransportError).toBe("request-timeout");
+      expect(sidecarSend).toHaveBeenCalledTimes(2);
+
+      const explicitlyBound = bridge.sendRequest(
+        "thread/start",
+        { cwd: "C:\\workspace", model: "claude-sonnet" },
+        { timeoutMs: 5_000 },
+      ) as Promise<unknown>;
+      const explicitlyBoundRejected = expect(explicitlyBound).rejects.toThrow(
+        "thread/start timed out after 5000ms; completion is unknown; request was not replayed",
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+      await explicitlyBoundRejected;
+      expect(sidecarSend).toHaveBeenCalledTimes(3);
+
+      const pendingAtDispose = bridge.sendRequest("thread/start", {
+        cwd: "C:\\workspace",
+        model: "claude-sonnet",
+      }) as Promise<unknown>;
+      const disposed = expect(pendingAtDispose).rejects.toThrow("was disposed");
+      await vi.advanceTimersByTimeAsync(0);
+      policy.dispose();
+      await disposed;
+      expect(onError).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(onError).toHaveBeenCalledTimes(4);
+      expect(sidecarSend).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("drains sidecar frames parked before the bridge installed", () => {
     const manager = requestManagerFixture();
@@ -327,6 +533,10 @@ describe("Desktop connection snapshot discovery", () => {
     receive(JSON.stringify({ id: -71, method: "item/commandExecution/requestApproval", params: { threadId: "external-1" } }));
     const routedRequest = (manager.onRequest as ReturnType<typeof vi.fn>).mock.lastCall?.[0] as { id: string };
     expect(routedRequest.id).toMatch(/^harnessmix\/remote-control-bridge\/server-request\//);
+    receive(JSON.stringify({ id: -71, method: "item/commandExecution/requestApproval", params: { threadId: "external-1" } }));
+    const replayedRequest = (manager.onRequest as ReturnType<typeof vi.fn>).mock.lastCall?.[0] as { id: string };
+    expect(manager.onRequest).toHaveBeenCalledTimes(2);
+    expect(replayedRequest.id).toBe(routedRequest.id);
 
     manager.sendAppServerResponse?.("item/commandExecution/requestApproval", {
       id: routedRequest.id,
@@ -337,6 +547,11 @@ describe("Desktop connection snapshot discovery", () => {
       id: -71,
       result: { decision: "decline" },
     });
+    manager.sendAppServerResponse?.("item/commandExecution/requestApproval", {
+      id: routedRequest.id,
+      result: { decision: "decline" },
+    });
+    expect(sidecarSend).toHaveBeenCalledTimes(1);
     expect(originalResponse).not.toHaveBeenCalled();
 
     const officialResponse = { id: "official-1", result: { decision: "decline" } };
@@ -1247,6 +1462,70 @@ describe("Renderer draft prewarm policy", () => {
       id: -71,
       result: { decision: "accept" },
     });
+  });
+
+  it("does not dispatch a queued request after its timeout has settled it", async () => {
+    const manager = requestManagerFixture();
+    const { bridge, directSend } = remoteRequestBridgeFixture();
+    const notifications = remoteNotificationTargetFixture();
+    const target = notifications.target;
+    installDraftPrewarmPolicyBridge(manager, bridge, "remote-control:fixture-host", target, {
+      discardAllPrewarmedThreads: vi.fn(),
+    });
+
+    const bootstrap = bridge.sendRequest("harnessmix/harness/inspect", {}) as Promise<unknown>;
+    const spawn = directSend.mock.calls.find(([method]) => method === "process/spawn");
+    const processHandle = (spawn?.[1] as { processHandle: string }).processHandle;
+    emitRemoteBridgeOutput(notifications, processHandle, {
+      method: "harnessmix/remote-control-bridge/ready",
+      params: { protocolVersion: 1 },
+    });
+    await vi.waitFor(() => expect(writtenBridgeFrames(directSend)).toHaveLength(1));
+    const initialize = writtenBridgeFrames(directSend)[0];
+    emitRemoteBridgeOutput(notifications, processHandle, { id: initialize?.id, result: {} });
+    await vi.waitFor(() => expect(writtenBridgeFrames(directSend)).toHaveLength(3));
+    const bootstrapFrame = writtenBridgeFrames(directSend)[2];
+    emitRemoteBridgeOutput(notifications, processHandle, { id: bootstrapFrame?.id, result: {} });
+    await bootstrap;
+
+    vi.useFakeTimers();
+    try {
+      let releaseWrite!: () => void;
+      const stalledWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+      directSend.mockImplementation((method: string) =>
+        method === "process/writeStdin" ? stalledWrite : Promise.resolve({}));
+
+      const occupying = bridge.sendRequest(
+        "harnessmix/harness/inspect",
+        {},
+        { timeoutMs: 60_000 },
+      ) as Promise<unknown>;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writtenBridgeFrames(directSend)).toHaveLength(4);
+
+      const queued = bridge.sendRequest(
+        "harnessmix/harness/inspect",
+        {},
+        { timeoutMs: 5_000 },
+      ) as Promise<unknown>;
+      const queuedRejected = expect(queued).rejects.toThrow("timed out after 5000ms");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await queuedRejected;
+      expect(writtenBridgeFrames(directSend)).toHaveLength(4);
+
+      releaseWrite();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writtenBridgeFrames(directSend)).toHaveLength(4);
+      const occupyingFrame = writtenBridgeFrames(directSend)[3];
+      emitRemoteBridgeOutput(notifications, processHandle, {
+        id: occupyingFrame?.id,
+        result: { status: "ready" },
+      });
+      await expect(occupying).resolves.toEqual({ status: "ready" });
+    } finally {
+      (target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("routes external Thread management from persisted ownership without restoring its Harness", async () => {
