@@ -10,6 +10,30 @@ function isEligibleClaudeHistorySyncThread(thread) {
     && thread.nativeHistorySync?.enabled === true;
 }
 
+function mayHaveForkedNativeHistorySync(thread) {
+  return isEligibleClaudeHistorySyncThread(thread)
+    && typeof thread.nativeHistorySnapshot.nativeSessionId === 'string'
+    && thread.nativeHistorySnapshot.nativeSessionId !== thread.nativeSessionId;
+}
+
+function detachForkedNativeHistorySync(thread, checkedAt = Date.now()) {
+  if (!mayHaveForkedNativeHistorySync(thread)) return false;
+  const originSessionId = thread.nativeHistorySnapshot.nativeSessionId;
+  const lineage = (thread.rewindHistory ?? []).findLast(entry => entry?.nativeSessionId === originSessionId);
+  if (!lineage) return false;
+  const sourceFile = thread.nativeHistorySync.sourceFile;
+  if (typeof sourceFile === 'string') {
+    const sourceSessionId = path.basename(sourceFile, path.extname(sourceFile));
+    if (sourceSessionId !== originSessionId) return false;
+    if (typeof lineage.nativeSessionFile !== 'string') lineage.nativeSessionFile = sourceFile;
+    if (thread.nativeSessionFile === sourceFile) delete thread.nativeSessionFile;
+  }
+  thread.nativeHistorySync = { enabled: false, paused: false, status: 'detached',
+    reason: 'native-session-forked', checkedAt };
+  delete thread.nativeHistorySnapshot;
+  return true;
+}
+
 function sourceIdentity(row) {
   const uuid = row?.uuid;
   if (typeof uuid !== 'string' || !uuid) return null;
@@ -220,5 +244,6 @@ class ClaudeHistorySync {
   }
 }
 
-module.exports = { ClaudeHistorySync, DEFAULT_DISCOVERY_INTERVAL_MS, DEFAULT_INTERVAL_MS, branchChain, checkpointFingerprint, hashBytes,
-  hashPrefix, isEligibleClaudeHistorySyncThread, parseCompleteJsonl };
+module.exports = { ClaudeHistorySync, DEFAULT_DISCOVERY_INTERVAL_MS, DEFAULT_INTERVAL_MS, branchChain, checkpointFingerprint,
+  detachForkedNativeHistorySync, hashBytes, hashPrefix, isEligibleClaudeHistorySyncThread,
+  mayHaveForkedNativeHistorySync, parseCompleteJsonl };

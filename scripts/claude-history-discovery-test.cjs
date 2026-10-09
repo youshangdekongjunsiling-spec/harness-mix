@@ -71,6 +71,13 @@ async function main() {
   assert.equal(second.length, 0);
   assert.equal(reads.get(partialFile), partialReads, 'unchanged incomplete source is cached');
   assert.equal(reads.get(sideFile), sideReads, 'unchanged sidechain source is cached');
+  const afterFork = await discover({ knownNativeSessions: [{ harnessId: 'claude',
+    nativeSessionId: '66666666-6666-4666-8666-666666666666' }] });
+  assert.equal(afterFork.length, 1, 'the preserved origin remains independently discoverable after its Host thread forks');
+  assert.equal(afterFork[0].nativeSessionId, validId);
+  assert.equal(afterFork[0].nativeSessionFile, validFile);
+  assert.equal(afterFork[0].id, discoveredThreadId(validId));
+  assert.equal(afterFork[0].nativeHistorySync.enabled, true);
 
   const store = path.join(root, 'store');
   const runtime = new HostRuntime({ dataDirectory: store, claudeHistorySync: {

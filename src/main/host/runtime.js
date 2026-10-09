@@ -20,7 +20,8 @@ const { UsageHistory } = require('./usage-history');
 const { HealthCenter } = require('./health');
 const { storageProjection } = require('./thread-storage');
 const { createWorkspace, inspectWorkspace, reviewWorkspace, applyWorkspace, removeWorkspace, discardWorkspace, pushWorkspace } = require('./collaboration-worktree');
-const { ClaudeHistorySync, checkpointFingerprint, isEligibleClaudeHistorySyncThread } = require('./claude-history-sync');
+const { ClaudeHistorySync, checkpointFingerprint, detachForkedNativeHistorySync,
+  isEligibleClaudeHistorySyncThread, mayHaveForkedNativeHistorySync } = require('./claude-history-sync');
 
 /**
  * Host Runtime：harness-mix 的核心职责 —— 自研 Desktop 背后的
@@ -96,6 +97,11 @@ class HostRuntime {
       thread.harnessId = this.resolveHarnessId(thread.harnessId) || thread.harnessId;
       for (const entry of thread.harnessChain || []) entry.harnessId = this.resolveHarnessId(entry.harnessId) || entry.harnessId;
       if (thread.pendingHandoff) thread.pendingHandoff.fromHarnessId = this.resolveHarnessId(thread.pendingHandoff.fromHarnessId) || thread.pendingHandoff.fromHarnessId;
+      // Older rollback records retained a sync baseline for the preserved
+      // origin branch. Hydrate only those strong identity mismatches, then
+      // require matching rewind lineage before detaching the stale baseline.
+      if (thread._storageStub && mayHaveForkedNativeHistorySync(thread)) this.store.hydrateInto(thread);
+      detachForkedNativeHistorySync(thread);
       if (thread._storageStub) {
         if (isDefaultTitle(thread.title) && thread.preview) {
           const derived = deriveThreadTitle(thread.preview, [], { isWorktree: thread.workspace?.mode === 'worktree' });
@@ -913,10 +919,19 @@ class HostRuntime {
     const nativeSessionId = result.nativeSessionId ?? result.session.nativeSessionId;
     if (!nativeSessionId) { await adapter.close(result.session); throw new Error('原生回退未返回会话标识'); }
     if (old) await old.adapter.close(old);
+    const previousNativeSessionId = thread.nativeSessionId;
+    const previousNativeSessionFile = thread.nativeHistorySync?.sourceFile || thread.nativeSessionFile;
     thread.rewindHistory ??= [];
-    thread.rewindHistory.push({ nativeSessionId: thread.nativeSessionId, at: Date.now(), numTurns });
+    thread.rewindHistory.push({ nativeSessionId: previousNativeSessionId,
+      ...(typeof previousNativeSessionFile === 'string' ? { nativeSessionFile: previousNativeSessionFile } : {}),
+      at: Date.now(), numTurns });
     thread.nativeSessionId = nativeSessionId;
     thread.nativeSessionFile = result.session.nativeSessionFile;
+    // A native rollback is a fork. The imported Claude sync baseline belongs to
+    // the preserved origin branch and must never follow the Host thread onto
+    // the new branch. A future sync may be attached only after independently
+    // verifying the new transcript and target checkpoint.
+    const nativeHistorySyncDetached = detachForkedNativeHistorySync(thread);
     const end = boundary ? thread.messages.indexOf(boundary) + 1 : 0;
     thread.messages = thread.messages.slice(0, end);
     thread.restore = false;
@@ -937,6 +952,10 @@ class HostRuntime {
       await this.#open(thread, adapter);
     }
     await this.#save(); this.#broadcast();
+    if (nativeHistorySyncDetached) {
+      for (const listener of this.listeners) listener({ type: 'native-history-sync-status', threadId,
+        status: 'detached', reason: 'native-session-forked' });
+    }
     return thread;
   }
 
