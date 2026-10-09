@@ -572,6 +572,7 @@ export function installTeamCards(options: TeamCardOptions = {}) {
   let activeThreadId = "";
   let activeRefreshPending = false;
   const panelSignatures = new WeakMap<Element, string>();
+  const panelsByCandidate = new WeakMap<Element, HTMLElement>();
 
   const closeWorkbench = () => {
     workbench?.remove();
@@ -812,27 +813,92 @@ export function installTeamCards(options: TeamCardOptions = {}) {
   };
   document.addEventListener("keydown", onKey);
 
-  const scan = () => {
+  const removeCandidatePanel = (candidate: HTMLElement) => {
+    panelsByCandidate.get(candidate)?.remove();
+    panelsByCandidate.delete(candidate);
+    if (candidate.tagName === "PRE") {
+      if (candidate.dataset.harnessMixTeamDisplay) {
+        candidate.style.display = candidate.dataset.harnessMixTeamDisplay === DISPLAY_SENTINEL ? "" : candidate.dataset.harnessMixTeamDisplay;
+        delete candidate.dataset.harnessMixTeamDisplay;
+      }
+    }
+    panelSignatures.delete(candidate);
+  };
+
+  const scanCandidates = (candidates: Iterable<HTMLElement>) => {
     if (disposed) return;
-    for (const candidate of document.querySelectorAll<HTMLElement>(SCAN_SELECTOR)) {
+    const payloads = new Map<HTMLElement, TeamCardPayload>();
+    for (const candidate of candidates) {
+      if (!candidate.isConnected) continue;
       if (candidate.closest(".harness-mix-team-panel,.harness-mix-team-workbench")) continue;
       const payload = parseTeamPayload(candidate.textContent ?? "");
-      if (!payload) continue;
-      if ([...candidate.querySelectorAll<HTMLElement>(SCAN_SELECTOR)].some((child) => parseTeamPayload(child.textContent ?? ""))) continue;
+      if (payload) payloads.set(candidate, payload);
+    }
+
+    // Wrappers and their nested tool output can both match SCAN_SELECTOR.
+    // Mark payload-bearing ancestors in one pass instead of rescanning every
+    // candidate subtree and parsing the same text repeatedly.
+    const shadowed = new Set<HTMLElement>();
+    for (const candidate of payloads.keys()) {
+      for (let parent = candidate.parentElement; parent; parent = parent.parentElement) {
+        if (payloads.has(parent)) shadowed.add(parent);
+      }
+      if (!shadowed.has(candidate) && [...candidate.querySelectorAll<HTMLElement>(SCAN_SELECTOR)].some((child) => panelSignatures.has(child))) {
+        shadowed.add(candidate);
+      }
+    }
+
+    for (const [candidate, payload] of payloads) {
+      if (shadowed.has(candidate)) {
+        removeCandidatePanel(candidate);
+        continue;
+      }
       const signature = `${payload.updated_at ?? 0}:${payload.tasks.length}:${payload.messages.length}:${payload.members.map((member) => member.display_status).join(",")}`;
       if (panelSignatures.get(candidate) === signature) continue;
       const panel = renderSummary(payload, () => openWorkbench(payload), options.openThread, options.userAction);
       if (candidate.tagName === "PRE") {
         if (!candidate.dataset.harnessMixTeamDisplay) candidate.dataset.harnessMixTeamDisplay = candidate.style.display || DISPLAY_SENTINEL;
         candidate.style.display = "none";
-        if (candidate.nextElementSibling?.classList.contains("harness-mix-team-panel")) candidate.nextElementSibling.remove();
+        panelsByCandidate.get(candidate)?.remove();
         candidate.after(panel);
       } else {
-        candidate.querySelector(":scope > .harness-mix-team-panel")?.remove();
+        panelsByCandidate.get(candidate)?.remove();
         candidate.append(panel);
       }
+      panelsByCandidate.set(candidate, panel);
       panelSignatures.set(candidate, signature);
     }
+  };
+
+  const scan = () => scanCandidates(document.querySelectorAll<HTMLElement>(SCAN_SELECTOR));
+  const dirtyCandidates = new Set<HTMLElement>();
+  let scanQueued = false;
+  const addCandidateAncestors = (node: Node) => {
+    for (let element = node instanceof Element ? node : node.parentElement; element; element = element.parentElement) {
+      if (element.matches(SCAN_SELECTOR)) dirtyCandidates.add(element as HTMLElement);
+    }
+  };
+  const addCandidateTree = (node: Node) => {
+    addCandidateAncestors(node);
+    if (!(node instanceof Element)) return;
+    if (node.matches(SCAN_SELECTOR)) dirtyCandidates.add(node as HTMLElement);
+    node.querySelectorAll<HTMLElement>(SCAN_SELECTOR).forEach((candidate) => dirtyCandidates.add(candidate));
+  };
+  const queueDirtyScan = (records: MutationRecord[]) => {
+    if (disposed) return;
+    for (const record of records) {
+      addCandidateAncestors(record.target);
+      record.addedNodes.forEach(addCandidateTree);
+    }
+    if (!dirtyCandidates.size || scanQueued) return;
+    scanQueued = true;
+    queueMicrotask(() => {
+      scanQueued = false;
+      if (disposed) return;
+      const candidates = [...dirtyCandidates];
+      dirtyCandidates.clear();
+      scanCandidates(candidates);
+    });
   };
 
   const removeActivePanel = () => {
@@ -894,7 +960,7 @@ export function installTeamCards(options: TeamCardOptions = {}) {
     }
   };
 
-  const observer = new MutationObserver(scan);
+  const observer = new MutationObserver(queueDirtyScan);
   observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true });
   scan();
   void refreshActiveTeam();
@@ -906,6 +972,7 @@ export function installTeamCards(options: TeamCardOptions = {}) {
     dispose() {
       disposed = true;
       observer.disconnect();
+      dirtyCandidates.clear();
       if (activeTimer) clearInterval(activeTimer);
       activeTimer = null;
       removeActivePanel();

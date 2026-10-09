@@ -260,6 +260,46 @@ describe("Desktop connection snapshot discovery", () => {
     expect(fixture.notice()).not.toBeNull();
     (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
   });
+  it("skips inactive scans and coalesces mutation bursts into one render", () => {
+    vi.useFakeTimers();
+    const fixture = syncStatusTargetFixture("external-a");
+    let disposed = false;
+    try {
+      installDraftPrewarmPolicyBridge(
+        requestManagerFixture(),
+        requestBridgeFixture(),
+        "local",
+        fixture.target,
+        { discardAllPrewarmedThreads: vi.fn() },
+      );
+      for (let index = 0; index < 50; index += 1) fixture.mutate();
+      expect(fixture.queryCount()).toBe(0);
+      vi.advanceTimersByTime(0);
+      expect(fixture.queryCount()).toBe(0);
+
+      fixture.deliver({
+        method: "harnessmix/thread/nativeHistorySync/updated",
+        params: { threadId: "external-a", status: "paused", reason: "branch-a" },
+      });
+      expect(fixture.queryCount()).toBe(1);
+      for (let index = 0; index < 50; index += 1) fixture.mutate();
+      expect(fixture.queryCount()).toBe(1);
+      vi.advanceTimersByTime(0);
+      expect(fixture.queryCount()).toBe(2);
+
+      for (let index = 0; index < 20; index += 1) fixture.mutate();
+      (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void }).dispose();
+      disposed = true;
+      vi.advanceTimersByTime(0);
+      expect(fixture.queryCount()).toBe(2);
+    } finally {
+      if (!disposed) {
+        (fixture.target.__harnessmixDraftPrewarmPolicyV1 as { dispose(): void } | undefined)
+          ?.dispose();
+      }
+      vi.useRealTimers();
+    }
+  });
   it("explicitly rejects unsupported remote approval hooks before changing transport", () => {
     const bridge = requestBridgeFixture();
     const send = bridge.sendRequest;
@@ -427,6 +467,8 @@ function syncStatusTargetFixture(initialThreadId: string): {
   target: DraftPrewarmPolicyTarget;
   notice(): { id: string; textContent: string | null } | null;
   navigate(threadId: string): void;
+  mutate(threadId?: string): void;
+  queryCount(): number;
   deliver(value: Record<string, unknown>): void;
   dismiss(): void;
   observerDisconnect: ReturnType<typeof vi.fn>;
@@ -434,6 +476,7 @@ function syncStatusTargetFixture(initialThreadId: string): {
   let activeThreadId = initialThreadId;
   let mutationListener: (() => void) | null = null;
   let dismissListener: (() => void) | null = null;
+  let composerQueryCount = 0;
   const observerDisconnect = vi.fn();
   const sessionValues = new Map<string, string>();
   const notices = new Map<string, {
@@ -481,7 +524,10 @@ function syncStatusTargetFixture(initialThreadId: string): {
     },
     document: {
       getElementById: (id) => notices.get(id) ?? null,
-      querySelectorAll: () => [marker],
+      querySelectorAll: () => {
+        composerQueryCount += 1;
+        return [marker];
+      },
       createElement: (tag) => {
         const attributes = new Map<string, string>();
         const element = {
@@ -522,8 +568,15 @@ function syncStatusTargetFixture(initialThreadId: string): {
     notice: () => notices.get("harnessmix-sync-status") ?? null,
     navigate(threadId) {
       activeThreadId = threadId;
+      for (const listener of listeners.get("popstate") ?? []) {
+        listener({} as Event);
+      }
+    },
+    mutate(threadId = activeThreadId) {
+      activeThreadId = threadId;
       mutationListener?.();
     },
+    queryCount: () => composerQueryCount,
     deliver(value) {
       (target.__harnessmixSidecarReceiveV1 as (frame: string) => void)(JSON.stringify(value));
     },

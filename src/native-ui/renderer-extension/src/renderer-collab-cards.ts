@@ -219,24 +219,55 @@ export function installCollabCards(options: CollabCardOptions = {}) {
     card.append(strip);
   };
 
-  const scan = () => {
+  const selector = '[data-local-conversation-item-target-ids], [data-turn-key], [data-testid*="tool"], .prose, pre';
+
+  const scanCandidates = (candidates: Iterable<HTMLElement>) => {
     if (disposed) return;
-    const candidates = document.querySelectorAll<HTMLElement>(
-      '[data-local-conversation-item-target-ids], [data-turn-key], [data-testid*="tool"], .prose, pre'
-    );
     for (const card of candidates) {
+      if (!card.isConnected) continue;
+      if (card.closest(".harness-mix-collab-actions")) continue;
       if (alreadyEnhanced.has(card)) continue;
       const payload = parseCollabPayload(card.textContent || "");
-      if (payload) {
-        enhanceCard(card, payload);
-      }
+      if (payload) enhanceCard(card, payload);
     }
   };
 
-  const observer = new MutationObserver(() => scan());
+  const scan = () => scanCandidates(document.querySelectorAll<HTMLElement>(selector));
+  const dirtyCandidates = new Set<HTMLElement>();
+  let scanQueued = false;
+  const addCandidateAncestors = (node: Node) => {
+    for (let element = node instanceof Element ? node : node.parentElement; element; element = element.parentElement) {
+      if (element.matches(selector)) dirtyCandidates.add(element as HTMLElement);
+    }
+  };
+  const addCandidateTree = (node: Node) => {
+    addCandidateAncestors(node);
+    if (!(node instanceof Element)) return;
+    if (node.matches(selector)) dirtyCandidates.add(node as HTMLElement);
+    node.querySelectorAll<HTMLElement>(selector).forEach((candidate) => dirtyCandidates.add(candidate));
+  };
+  const queueDirtyScan = (records: MutationRecord[]) => {
+    if (disposed) return;
+    for (const record of records) {
+      addCandidateAncestors(record.target);
+      record.addedNodes.forEach(addCandidateTree);
+    }
+    if (!dirtyCandidates.size || scanQueued) return;
+    scanQueued = true;
+    queueMicrotask(() => {
+      scanQueued = false;
+      if (disposed) return;
+      const candidates = [...dirtyCandidates];
+      dirtyCandidates.clear();
+      scanCandidates(candidates);
+    });
+  };
+
+  const observer = new MutationObserver(queueDirtyScan);
   observer.observe(document.body || document.documentElement, {
     childList: true,
     subtree: true,
+    characterData: true,
   });
   scan();
 
@@ -245,6 +276,7 @@ export function installCollabCards(options: CollabCardOptions = {}) {
     dispose() {
       disposed = true;
       observer.disconnect();
+      dirtyCandidates.clear();
       document.querySelectorAll(".harness-mix-collab-actions").forEach((node) => node.remove());
     },
   };

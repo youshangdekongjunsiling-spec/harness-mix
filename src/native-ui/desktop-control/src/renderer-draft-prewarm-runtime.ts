@@ -49,6 +49,8 @@ export interface DraftPrewarmPolicyTarget {
     getItem(key: string): string | null;
     setItem(key: string, value: string): void;
   };
+  requestAnimationFrame?: (callback: () => void) => number;
+  cancelAnimationFrame?: (handle: number) => void;
   [key: string]: unknown;
   addEventListener?: (type: string, listener: (event: Event) => void) => void;
   dispatchEvent?: (event: Event) => boolean;
@@ -313,6 +315,19 @@ export function installDraftPrewarmPolicyBridge(
     const noticeDocument = target.document;
     if (!noticeDocument) return;
     const previous = noticeDocument.getElementById(syncNoticeElementId);
+    let hasUndismissedDiagnostic = false;
+    for (const [threadId, diagnostic] of nativeHistorySyncNotices) {
+      if (nativeHistorySyncDismissals.get(threadId) !== diagnostic.fingerprint) {
+        hasUndismissedDiagnostic = true;
+        break;
+      }
+    }
+    if (!hasUndismissedDiagnostic) {
+      if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
+      syncNoticeDismissTimer = null;
+      previous?.remove();
+      return;
+    }
     const threadId = activeThreadId();
     const diagnostic = threadId ? nativeHistorySyncNotices.get(threadId) : undefined;
     if (
@@ -941,11 +956,26 @@ export function installDraftPrewarmPolicyBridge(
   }
 
   const syncNoticeNavigationListener = (): void => renderNativeHistorySyncNotice();
+  let syncNoticeRenderFrame: number | null = null;
+  let syncNoticeRenderTimeout: ReturnType<typeof globalThis.setTimeout> | null = null;
+  const scheduleNativeHistorySyncNoticeRender = (): void => {
+    if (syncNoticeRenderFrame !== null || syncNoticeRenderTimeout !== null) return;
+    const render = (): void => {
+      syncNoticeRenderFrame = null;
+      syncNoticeRenderTimeout = null;
+      renderNativeHistorySyncNotice();
+    };
+    if (typeof target.requestAnimationFrame === "function") {
+      syncNoticeRenderFrame = target.requestAnimationFrame(render);
+    } else {
+      syncNoticeRenderTimeout = globalThis.setTimeout(render, 0);
+    }
+  };
   target.addEventListener?.("popstate", syncNoticeNavigationListener);
   target.addEventListener?.("hashchange", syncNoticeNavigationListener);
   const syncNoticeNavigationObserver =
     typeof target.MutationObserver === "function" && target.document?.body
-      ? new target.MutationObserver(syncNoticeNavigationListener)
+      ? new target.MutationObserver(scheduleNativeHistorySyncNoticeRender)
       : null;
   syncNoticeNavigationObserver?.observe(target.document!.body, {
     subtree: true,
@@ -1031,6 +1061,12 @@ export function installDraftPrewarmPolicyBridge(
       target.removeEventListener?.("popstate", syncNoticeNavigationListener);
       target.removeEventListener?.("hashchange", syncNoticeNavigationListener);
       syncNoticeNavigationObserver?.disconnect();
+      if (syncNoticeRenderFrame !== null) {
+        target.cancelAnimationFrame?.(syncNoticeRenderFrame);
+      }
+      if (syncNoticeRenderTimeout !== null) globalThis.clearTimeout(syncNoticeRenderTimeout);
+      syncNoticeRenderFrame = null;
+      syncNoticeRenderTimeout = null;
       if (syncNoticeDismissTimer !== null) globalThis.clearTimeout(syncNoticeDismissTimer);
       syncNoticeDismissTimer = null;
       target.document?.getElementById(syncNoticeElementId)?.remove();
