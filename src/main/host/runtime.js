@@ -1005,6 +1005,7 @@ class HostRuntime {
     const thread = this.#requireThread(threadId);
     if (this.execution.isRunning(thread.id)) throw new Error('任务执行中，不能归档');
     thread.archived = Boolean(archived);
+    if (thread.nativeHistoryLineage?.autoArchived) delete thread.nativeHistoryLineage.autoArchived;
     await this.#save(); this.#broadcast();
   }
 
@@ -1345,6 +1346,9 @@ class HostRuntime {
       ...(candidate.coreState ? { coreState: structuredClone(candidate.coreState) } : {}),
       ...(candidate.nativeHistorySnapshot ? { nativeHistorySnapshot: structuredClone(candidate.nativeHistorySnapshot) } : {}),
       ...(candidate.nativeHistorySync ? { nativeHistorySync: structuredClone(candidate.nativeHistorySync) } : {}),
+      ...(candidate.nativeHistoryLineage ? { nativeHistoryLineage: structuredClone(candidate.nativeHistoryLineage) } : {}),
+      ...(candidate.titleLocked ? { titleLocked: true } : {}),
+      ...(candidate.archived === true ? { archived: true } : {}),
       ...(candidate.parentThreadId ? { parentThreadId: candidate.parentThreadId } : {}),
       ...(candidate.nativeReadOnly ? { nativeReadOnly: true } : {}) };
     this.threads.unshift(thread);
@@ -1371,7 +1375,21 @@ class HostRuntime {
     if (existing) return existing;
     if (await this.store.wasRemoved({ threadId: candidate.id, harnessId: candidate.harnessId,
       nativeSessionId: candidate.nativeSessionId })) return null;
-    return this.importNativeSession(candidate);
+    const origins = this.threads.flatMap(thread => (thread.harnessId === candidate.harnessId
+      ? thread.rewindHistory ?? [] : []).flatMap(entry =>
+      entry?.nativeSessionId === candidate.nativeSessionId && Number.isFinite(entry.at)
+        ? [{ thread, entry }] : []));
+    const origin = origins.sort((left, right) => right.entry.at - left.entry.at)[0];
+    if (!origin) return this.importNativeSession(candidate);
+    const sourceTitle = String(origin.thread.title || candidate.title || 'Claude 会话').trim();
+    const title = sourceTitle.startsWith('[原始分支]') ? sourceTitle : `[原始分支] ${sourceTitle}`;
+    const hasIndependentNewerWork = !Number.isFinite(candidate.updatedAt)
+      || candidate.updatedAt > origin.entry.at;
+    return this.importNativeSession({ ...candidate, title, titleLocked: true,
+      ...(!hasIndependentNewerWork ? { archived: true } : {}),
+      nativeHistoryLineage: { relation: 'rewind-origin', forkThreadId: origin.thread.id,
+        forkNativeSessionId: origin.thread.nativeSessionId, forkedAt: origin.entry.at,
+        ...(!hasIndependentNewerWork ? { autoArchived: true } : {}) } });
   }
 
   /** Explicitly enabled, already-imported Claude sources eligible for one-way append sync. */
@@ -1469,6 +1487,11 @@ class HostRuntime {
     const changedTurnIds = checkpoint.turns.filter(turn => !beforeTurns.has(turn.id)
       || JSON.stringify(beforeTurns.get(turn.id)) !== JSON.stringify(turn)
       || turn.itemIds.some(id => changedItems.has(id))).map(turn => turn.id);
+
+    if (newTurnIds.length && thread.archived && thread.nativeHistoryLineage?.autoArchived) {
+      thread.archived = false;
+      delete thread.nativeHistoryLineage.autoArchived;
+    }
 
     this.core.restore(checkpoint);
     this.execution.lastTurns.set(thread.id, checkpoint.turns.at(-1)?.id);

@@ -24,6 +24,12 @@ try {
   assert.deepEqual(events.filter(event => event.method === 'item/completed').map(event => event.params.item.id), items.map(item => item.id));
   assert(events.some(event => event.method === 'thread/status/changed' && event.params.status.type === 'idle'));
   assert(!events.some(event => event.method.endsWith('/delta')));
+  thread.archived = true;
+  const archivedEventCount = events.length;
+  listener({ type: 'native-history-synced', thread, newTurnIds: [turn.id], changedTurnIds: [turn.id], changedItemIds: items.map(item => item.id) });
+  assert.equal(events.length, archivedEventCount,
+    'archived history sync does not emit thread or turn notifications that can resurrect it');
+  thread.archived = false;
   listener({ type: 'native-history-sync-status', threadId: thread.id, status: 'paused', reason: 'branch-changed' });
   assert.equal(events.at(-1).method, 'harnessmix/thread/nativeHistorySync/updated');
   console.log('PASS: stable sync item IDs, completed turns, idle state and pause notice');

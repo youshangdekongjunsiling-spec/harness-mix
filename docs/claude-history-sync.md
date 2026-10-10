@@ -90,3 +90,13 @@ node scripts/native-protocol-test.cjs
 The upstream `v0.4.0` lockfile is stale relative to its optional native package versions and workspace declarations, so `npm ci` fails before running tests. The validation checkout used `npm install --ignore-scripts --package-lock=false` without publishing an unrelated lockfile rewrite. Build JavaScript bundles before using the source checkout; generated `output/` and `dist/` files are intentionally not committed. Native sidecar isolation was also exercised with a fresh data directory and unchanged `0.4.0` native binaries.
 
 Reading and synchronizing local Claude transcripts does not require a Claude model request. Continuing a conversation does require working authentication in the CLI/SDK environment used by the adapter; authentication errors are separate from transcript import.
+
+## Original branches and diagnostic conversations
+
+Automatic discovery links a retained Claude rewind origin to the Host conversation that continued on a new native session. The imported origin is named `[原始分支] <continued conversation title>` and stores `nativeHistoryLineage` in both its record and lazy index. Its native transcript remains intact.
+
+An origin with no transcript activity newer than the rewind is initially archived. If it later synchronizes a new turn, an automatically archived origin returns to the normal list. Explicit archive/unarchive actions clear this automatic behavior, so synchronization respects the user's choice. An origin already containing newer work stays visible when first discovered. Existing imported records are not automatically renamed or re-archived on every scan.
+
+Archived imports and background synchronization do not emit sidebar `thread/started` notifications. History can still synchronize while archived.
+
+Discovery excludes only a standalone two-message diagnostic conversation: the exact prompt `Reply exactly HARNESS_MIX_HEALTH_OK. Do not use tools or modify files.` followed by the exact text reply `HARNESS_MIX_HEALTH_OK`, with no tool or non-text content. Conversations mentioning that marker, containing tools, or continuing with additional user messages remain eligible for import. A changed transcript is reconsidered on the next discovery scan.

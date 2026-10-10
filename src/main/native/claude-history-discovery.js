@@ -8,6 +8,8 @@ const { branchChain, checkpointFingerprint, hashBytes, hashPrefix, parseComplete
 const { createClaudeHistorySyncOptions } = require('./claude-sync-options');
 
 const SESSION_FILE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const HEALTH_PROBE_PROMPT = 'Reply exactly HARNESS_MIX_HEALTH_OK. Do not use tools or modify files.';
+const HEALTH_PROBE_REPLY = 'HARNESS_MIX_HEALTH_OK';
 
 function discoveredThreadId(nativeSessionId) {
   const bytes = crypto.createHash('sha256').update('claude\0' + nativeSessionId).digest().subarray(0, 16);
@@ -24,6 +26,22 @@ function visibleUser(row) {
   if (typeof content === 'string') return Boolean(content.trim());
   return Array.isArray(content) && content.some(block => (block?.type === 'text'
     && typeof block.text === 'string' && block.text.trim()) || block?.type === 'image');
+}
+
+function isStandaloneHealthProbe(rows) {
+  if (!Array.isArray(rows) || rows.length !== 2 || rows[0]?.type !== 'user'
+    || rows[1]?.type !== 'assistant') return false;
+  const texts = row => {
+    const content = row.message?.content;
+    if (typeof content === 'string') return [content];
+    if (!Array.isArray(content) || content.some(block => block?.type !== 'text'
+      || typeof block.text !== 'string')) return null;
+    return content.map(block => block.text);
+  };
+  const user = texts(rows[0]);
+  const assistant = texts(rows[1]);
+  return user?.length === 1 && user[0] === HEALTH_PROBE_PROMPT
+    && assistant?.length === 1 && assistant[0] === HEALTH_PROBE_REPLY;
 }
 
 function createClaudeHistoryDiscovery({ environment = process.env, home = os.homedir(),
@@ -75,6 +93,10 @@ function createClaudeHistoryDiscovery({ environment = process.env, home = os.hom
         if (branchRows.some(row => (row.sessionId ?? row.session_id) !== entry.nativeSessionId)) {
           throw new Error('mixed session identity');
         }
+        if (isStandaloneHealthProbe(branchRows)) {
+          rejected.set(entry.file, signature);
+          continue;
+        }
 
         const id = discoveredThreadId(entry.nativeSessionId);
         const timestamps = branchRows.map(row => Date.parse(row.timestamp)).filter(Number.isFinite);
@@ -109,5 +131,5 @@ function createClaudeHistoryDiscovery({ environment = process.env, home = os.hom
   };
 }
 
-module.exports = { createClaudeHistoryDiscovery, discoveredThreadId };
+module.exports = { createClaudeHistoryDiscovery, discoveredThreadId, isStandaloneHealthProbe };
 

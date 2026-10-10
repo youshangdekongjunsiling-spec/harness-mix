@@ -65,6 +65,12 @@ async function main() {
       assert.equal(announced[0].params.thread.id, 'announce-persisted');
       assert.equal(announced[0].params.thread.ephemeral, false);
       assert.deepEqual(announced[0].params.thread.turns, [], 'Re-announcement uses the turn-free listing projection');
+      const archivedEventsFrom = events.length;
+      for (const listener of runtime.listeners) listener({ type: 'thread-created', thread: archivedStub });
+      for (const listener of runtime.listeners) listener({ type: 'native-history-synced', thread: archivedStub,
+        previousTurnIds: [], changedTurnIds: [], changedItemIds: [], newTurnIds: [] });
+      assert.equal(events.slice(archivedEventsFrom).some(event => event?.method === 'thread/started'), false,
+        'archived history imports and syncs do not resurrect a sidebar entry');
     } finally {
       for (const stub of [persistedStub, ephemeralStub, archivedStub]) runtime.threads.splice(runtime.threads.indexOf(stub), 1);
     }

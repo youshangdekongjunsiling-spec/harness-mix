@@ -295,7 +295,7 @@ class NativeProtocol {
     this.unsubscribe = runtime.core.subscribe(({ event, projected }) => this.onCore(event, projected));
     // Host 侧新建的线程（协作子任务等）也要通知 Desktop 侧栏，与 thread/start 同一契约
     this.unsubscribeRuntime = runtime.subscribe(event => {
-      if (event?.type === 'native-history-synced' && event.thread) {
+      if (event?.type === 'native-history-synced' && event.thread && !event.thread.archived) {
         const threadId = event.thread.id;
         const newTurns = new Set(event.newTurnIds || []);
         const changedItems = new Set(event.changedItemIds || []);
@@ -319,10 +319,10 @@ class NativeProtocol {
         this.emit({ method: 'harnessmix/thread/nativeHistorySync/updated', params: { threadId: event.threadId, status: event.status, reason: event.reason } });
       }
 
-      if (event?.type === 'thread-created' && event.thread) this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread) } });
+      if (event?.type === 'thread-created' && event.thread && !event.thread.archived) this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread) } });
       // 预热线程转正后重发 thread/started（ephemeral=false）：Desktop 侧边栏 state db
       // 只登记非 ephemeral 宣告的线程，不重发则转正会话不进项目列表
-      if (event?.type === 'thread-persisted' && event.thread) this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread) } });
+      if (event?.type === 'thread-persisted' && event.thread && !event.thread.archived) this.emit({ method: 'thread/started', params: { thread: this.projectThread(event.thread) } });
       if (event?.type === 'thread-updated' && event.thread) {
         this.emit({ method: 'thread/name/updated', params: { threadId: event.thread.id, threadName: event.thread.title } });
       }
