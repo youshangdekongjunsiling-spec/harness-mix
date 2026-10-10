@@ -1,3 +1,4 @@
+import { DEFAULT_RENDERER_AGENTS } from "../../renderer-extension/src/agent-selection-state.js";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -475,5 +476,36 @@ describe("Renderer CDP Control Session", () => {
     expect(first.close).not.toHaveBeenCalled();
     expect(replacement.close).toHaveBeenCalledOnce();
     session.close();
+  });
+});
+
+
+describe("production Agent catalog handshake", () => {
+  it("keeps the real renderer catalog healthy across repeated monitor passes", async () => {
+    const client = rendererClient({ ...readyBinding(), enabledAgents: [...DEFAULT_RENDERER_AGENTS] });
+    const connect = vi.fn(async () => client);
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      enabledAgents: DEFAULT_RENDERER_AGENTS,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect,
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+    try {
+      for (let pass = 0; pass < 3; pass += 1) await session.ensureInstalled();
+      expect(connect).toHaveBeenCalledOnce();
+      expect(client.commands.filter(command => command.method === "Page.addScriptToEvaluateOnNewDocument")).toHaveLength(1);
+      expect(session.snapshot.binding.enabledAgents).toContain("kimi-code");
+    } finally {
+      session.close();
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { DEFAULT_RENDERER_AGENTS } from "@harnessmix/shared-contracts";
 import type {
   HarnessModelRef,
   HarnessPermissionModeId,
@@ -25,27 +26,7 @@ export const KNOWN_RENDERER_AGENTS = [
   "kimi-code",
   "codex-harness",
 ] as const;
-export const DEFAULT_RENDERER_AGENTS = [
-  'codex',
-  'pi',
-  'omp',
-  'claude-code',
-  'deepseek-harness',
-  'antigravity',
-  'opencode',
-  'grok',
-  'openclaw',
-  'hermes',
-  'qoder',
-  'codebuddy',
-  'zcode',
-  'trae',
-  'cursor-cli',
-  'kiro-cli',
-  'cline',
-  'kimi-code',
-  'codex-harness',
-] as const;
+export { DEFAULT_RENDERER_AGENTS } from "@harnessmix/shared-contracts";
 export type RendererAgent = (typeof KNOWN_RENDERER_AGENTS)[number];
 export type ExternalRendererAgent = Exclude<RendererAgent, "codex">;
 export type RendererAgentAvailability =

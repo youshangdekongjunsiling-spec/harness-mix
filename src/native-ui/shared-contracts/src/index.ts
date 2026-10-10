@@ -355,3 +355,5 @@ export const packageMetadata = {
   name: "@harnessmix/shared-contracts",
   contractVersion: WORKSPACE_CONTRACT_VERSION,
 } as const;
+
+export { DEFAULT_RENDERER_AGENTS } from "./renderer-agents.js";

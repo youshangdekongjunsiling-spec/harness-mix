@@ -1,0 +1,22 @@
+// Production renderer and controller must validate the same enabled Agent set.
+export const DEFAULT_RENDERER_AGENTS = [
+  'codex',
+  'pi',
+  'omp',
+  'claude-code',
+  'deepseek-harness',
+  'antigravity',
+  'opencode',
+  'grok',
+  'openclaw',
+  'hermes',
+  'qoder',
+  'codebuddy',
+  'zcode',
+  'trae',
+  'cursor-cli',
+  'kiro-cli',
+  'cline',
+  'kimi-code',
+  'codex-harness',
+] as const;

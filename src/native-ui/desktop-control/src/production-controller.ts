@@ -1,3 +1,4 @@
+import { DEFAULT_RENDERER_AGENTS } from "@harnessmix/shared-contracts";
 /**
  * The Desktop Controller main loop: parses launcher arguments, optionally
  * starts the local Host sidecar, installs the renderer bundle into the
@@ -264,26 +265,7 @@ export async function runDesktopController(
         rendererCdpEndpoint: options.rendererCdpEndpoint,
         rendererSource: `${RENDERER_CSP_BOOTSTRAP}\n${configuration}\n${rendererSource}`,
         ...(sidecar ? { sidecar } : {}),
-        enabledAgents: [
-          "codex",
-          "pi",
-          "claude-code",
-          "deepseek-harness",
-          "omp",
-          "opencode",
-          "grok",
-          "openclaw",
-          "hermes",
-          "antigravity",
-          "qoder",
-          "codebuddy",
-          "kiro-cli",
-          "cursor-cli",
-          "codex-harness",
-          "zcode",
-          "trae",
-          "cline",
-        ],
+        enabledAgents: DEFAULT_RENDERER_AGENTS,
         timeoutMs: PRODUCTION_INSTALL_TIMEOUT_MS,
       },
       dependencies,

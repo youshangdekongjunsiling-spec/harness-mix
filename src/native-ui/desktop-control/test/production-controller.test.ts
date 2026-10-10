@@ -1,3 +1,4 @@
+import { DEFAULT_RENDERER_AGENTS } from "../../renderer-extension/src/agent-selection-state.js";
 import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
@@ -141,28 +142,10 @@ describe("production Desktop Controller", () => {
       rendererCdpEndpoint: "http://127.0.0.1:43123",
       rendererSource:
         'globalThis.__zod_globalConfig ??= {}; globalThis.__zod_globalConfig.jitless = true;\nObject.defineProperty(window, "__harnessmixProductionConfigV1", { configurable: true, value: { defaultAgent: "pi" } });\nwindow.__harnessmixSidecarModeV1 = false;\nproduction renderer',
-      enabledAgents: [
-        "codex",
-        "pi",
-        "claude-code",
-        "deepseek-harness",
-        "omp",
-        "opencode",
-        "grok",
-        "openclaw",
-        "hermes",
-        "antigravity",
-        "qoder",
-        "codebuddy",
-        "kiro-cli",
-        "cursor-cli",
-        "codex-harness",
-        "zcode",
-        "trae",
-        "cline",
-      ],
+      enabledAgents: DEFAULT_RENDERER_AGENTS,
       timeoutMs: 90_000,
     });
+    expect(install.mock.calls[0]?.[0].enabledAgents).toContain("kimi-code");
     expect(startAttachmentServer).toHaveBeenCalledWith({
       port: 43124,
       nonce: attachmentNonce,
