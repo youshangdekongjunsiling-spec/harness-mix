@@ -1,0 +1,1 @@
+{"name":"harness-mix-dsh-runtime","private":true,"scripts":{"dsh":"node node_modules/@deepseek-ai/dsh/lib/bin.js"},"dependencies":{"@deepseek-ai/dsh":"0.2.0-rc.2"}}
