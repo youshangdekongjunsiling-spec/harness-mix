@@ -242,6 +242,25 @@ interface PendingSidecarProbe {
   resolve(): void;
 }
 
+const SIDECAR_DELIVERY_QUEUE_LIMIT = 256;
+const SIDECAR_DELIVERY_TIMEOUT_MS = 5_000;
+const SIDECAR_DELIVERY_ATTEMPTS = 2;
+const SIDECAR_DELIVERY_DEDUPE_LIMIT = 512;
+let sidecarDeliveryEpochSequence = 0;
+const newSidecarDeliveryEpoch = (): string =>
+  `${Date.now().toString(36)}-${(++sidecarDeliveryEpochSequence).toString(36)}`;
+
+class SidecarDeliveryRejectedError extends Error {}
+
+function sidecarFrameIsRequestOrResponse(frame: string): boolean {
+  try {
+    const value: unknown = JSON.parse(frame);
+    return isRecord(value) && value.id !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 function readSidecarProbeId(payload: string): string | null | undefined {
   try {
     const value: unknown = JSON.parse(payload);
@@ -263,15 +282,96 @@ function createSidecarBindingRelay(
   if (!renderer.on) throw new Error("Renderer CDP binding events are unavailable");
   const pendingProbes = new Map<string, PendingSidecarProbe>();
   let active = false;
+  let everActivated = false;
   let closed = false;
   let detachSidecar: (() => void) | undefined;
-  const deliverSidecarFrame = (frame: string): void => {
+  const deliveryQueue: Array<{ frame: string; important: boolean }> = [];
+  let deliveryRunning = false;
+  let deliveryGeneration = 0;
+  let deliveryFault: Error | null = null;
+  let deliveryEpochReady = false;
+  let deliveryEpoch = newSidecarDeliveryEpoch();
+  let nextDeliveryOrdinal = 1;
+  const deliveryExpression = (frame: string, deliveryId: string): string => {
     const payload = JSON.stringify(frame);
-    void renderer
-      .command("Runtime.evaluate", {
-        expression: `(() => { const frame = ${payload}; if (typeof window.__harnessmixSidecarReceiveV1 === "function") window.__harnessmixSidecarReceiveV1(frame); else (window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame); })()`,
-      })
-      .catch(() => undefined);
+    const epoch = JSON.stringify(deliveryEpoch);
+    const id = JSON.stringify(deliveryId);
+    return `(() => { const epoch = ${epoch}, id = ${id}; if (window.__harnessmixSidecarDeliveryEpochV1 !== epoch) return "stale"; const state = window.__harnessmixSidecarDeliveryStateV1 ??= { epoch, seen: new Set(), order: [] }; if (state.epoch !== epoch) { state.epoch = epoch; state.seen = new Set(); state.order = []; } if (state.seen.has(id)) return "duplicate"; state.seen.add(id); state.order.push(id); if (state.order.length > ${SIDECAR_DELIVERY_DEDUPE_LIMIT}) state.seen.delete(state.order.shift()); const frame = ${payload}; if (typeof window.__harnessmixSidecarReceiveV1 === "function") window.__harnessmixSidecarReceiveV1(frame); else (window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame); return "delivered"; })()`;
+  };
+  const deliverOnce = async (
+    frame: string,
+    deliveryId: string,
+    generation: number,
+  ): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const response = await Promise.race([
+        renderer.command("Runtime.evaluate", { expression: deliveryExpression(frame, deliveryId) }),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("Renderer CDP sidecar frame delivery timed out")),
+            SIDECAR_DELIVERY_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      if (!isRecord(response) || isRecord(response.exceptionDetails)) {
+        throw new SidecarDeliveryRejectedError("Renderer CDP rejected a sidecar frame delivery");
+      }
+      const result = isRecord(response.result) ? response.result : null;
+      if (result?.value !== "delivered" && result?.value !== "duplicate") {
+        throw new Error(
+          result?.value === "stale"
+            ? "Renderer CDP sidecar delivery epoch is stale"
+            : "Renderer CDP did not acknowledge a sidecar frame delivery",
+        );
+      }
+      if (closed || !active || generation !== deliveryGeneration) {
+        throw new Error("Renderer CDP sidecar relay changed during frame delivery");
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const pumpDeliveries = (): void => {
+    if (deliveryRunning || closed || !active || !deliveryEpochReady) return;
+    deliveryRunning = true;
+    const generation = deliveryGeneration;
+    void (async () => {
+      while (!closed && active && generation === deliveryGeneration) {
+        const next = deliveryQueue.shift();
+        if (!next) break;
+        const deliveryId = `${deliveryEpoch}/${nextDeliveryOrdinal}`;
+        nextDeliveryOrdinal += 1;
+        let failure: unknown;
+        for (let attempt = 0; attempt < SIDECAR_DELIVERY_ATTEMPTS; attempt += 1) {
+          try {
+            await deliverOnce(next.frame, deliveryId, generation);
+            failure = undefined;
+            break;
+          } catch (error) {
+            failure = error;
+            if (closed || !active || generation !== deliveryGeneration) break;
+            if (error instanceof SidecarDeliveryRejectedError) break;
+          }
+        }
+        if (failure !== undefined && active && generation === deliveryGeneration) {
+          deliveryFault = failure instanceof Error ? failure : new Error(String(failure));
+        }
+      }
+    })().finally(() => {
+      deliveryRunning = false;
+      if (!closed && active && deliveryQueue.length > 0) pumpDeliveries();
+    });
+  };
+  const deliverSidecarFrame = (frame: string): void => {
+    const important = sidecarFrameIsRequestOrResponse(frame);
+    if (deliveryQueue.length >= SIDECAR_DELIVERY_QUEUE_LIMIT) {
+      deliveryFault = new Error("Renderer CDP sidecar delivery queue is full");
+      deactivate();
+      return;
+    }
+    deliveryQueue.push({ frame, important });
+    pumpDeliveries();
   };
   const detachBinding = renderer.on("Runtime.bindingCalled", (params) => {
     if (
@@ -295,19 +395,50 @@ function createSidecarBindingRelay(
   });
   const deactivate = (): void => {
     active = false;
+    deliveryEpochReady = false;
+    deliveryGeneration += 1;
     detachSidecar?.();
     detachSidecar = undefined;
   };
+  const installDeliveryEpoch = async (reset: boolean): Promise<void> => {
+    if (reset) {
+      deliveryEpoch = newSidecarDeliveryEpoch();
+      nextDeliveryOrdinal = 1;
+    }
+    const generation = deliveryGeneration;
+    const response = await renderer.command("Runtime.evaluate", {
+      expression: `window.__harnessmixSidecarDeliveryEpochV1 = ${JSON.stringify(deliveryEpoch)}`,
+    });
+    if (!isRecord(response) || isRecord(response.exceptionDetails)) {
+      throw new Error("Renderer CDP rejected the sidecar delivery epoch");
+    }
+    if (active && generation === deliveryGeneration) {
+      deliveryEpochReady = true;
+      pumpDeliveries();
+    }
+  };
+  const activateRelay = (): void => {
+    if (closed || active) return;
+    everActivated = true;
+    active = true;
+    deliveryGeneration += 1;
+    const generation = deliveryGeneration;
+    void installDeliveryEpoch(false).catch((error: unknown) => {
+      if (active && generation === deliveryGeneration) {
+        deliveryFault = error instanceof Error ? error : new Error(String(error));
+      }
+    });
+    detachSidecar = sidecar.onFrame(deliverSidecarFrame);
+  };
   return {
     activate() {
-      if (closed || active) return;
-      active = true;
-      detachSidecar = sidecar.onFrame(deliverSidecarFrame);
+      activateRelay();
     },
     close() {
       if (closed) return;
       closed = true;
       deactivate();
+      deliveryQueue.length = 0;
       detachBinding();
       for (const probe of pendingProbes.values()) {
         probe.reject(new Error("Renderer CDP sidecar relay is closed"));
@@ -317,6 +448,11 @@ function createSidecarBindingRelay(
     deactivate,
     async probe() {
       if (closed) throw new Error("Renderer CDP sidecar relay is closed");
+      if (deliveryFault) {
+        const fault = deliveryFault;
+        deliveryFault = null;
+        throw fault;
+      }
       const id = `${Date.now().toString(36)}-${(++sidecarProbeSequence).toString(36)}`;
       const envelope = JSON.stringify({
         [SIDECAR_PROBE_KEY]: { version: 1, id },
@@ -376,6 +512,8 @@ function createSidecarBindingRelay(
         .command("Runtime.removeBinding", { name: SIDECAR_BINDING_NAME })
         .catch(() => undefined);
       await renderer.command("Runtime.addBinding", { name: SIDECAR_BINDING_NAME });
+      await installDeliveryEpoch(true);
+      if (everActivated && !active) activateRelay();
     },
   };
 }

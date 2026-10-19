@@ -1,5 +1,9 @@
 const assert = require('node:assert/strict');
-const { projectNotification, queueRequest, usageView, modelView } = require('../src/main/adapters/codex');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { projectNotification, queueRequest, usageView, modelView, configuredProviderModels, withConfiguredProviderModels, modelCatalogJson, threadOptions, forkOptions, publicReasoningText, nativeChildMessages } = require('../src/main/adapters/codex');
+const { appServerLaunch, appServerSharedKey } = require('../src/main/adapters/codex-app-server');
 
 function fakeSession() {
   return {
@@ -30,6 +34,40 @@ function fakeSession() {
   assert.ok(events.some(event => event.kind === 'tool' && event.toolCallId === 'tool-1' && event.state === 'done' && event.title === 'exec_command' && event.input === 'git status'));
   assert.ok(events.some(event => event.kind === 'usage' && event.usage.contextPercent === 25));
   assert.ok(events.some(event => event.kind === 'completed' && event.nativeRef.checkpointId === 'turn-1'));
+
+  const completedReasoningSession = fakeSession();
+  const completedReasoningEvents = [];
+  projectNotification({ method: 'item/completed', params: { threadId: 'thread-native', turnId: 'turn-2', item: {
+    type: 'reasoning', id: 'reason-content', summary: [],
+    content: ['公开推理正文'],
+  } } }, completedReasoningSession, event => completedReasoningEvents.push(event));
+  assert.deepEqual(completedReasoningEvents.map(event => [event.kind, event.text]), [['thinking-delta', '公开推理正文']],
+    'Completed reasoning falls back to public content when summary/delta is absent');
+  projectNotification({ method: 'item/completed', params: { threadId: 'thread-native', turnId: 'turn-2', item: {
+    type: 'reasoning', id: 'reason-content', summary: [], content: ['公开推理正文'],
+  } } }, completedReasoningSession, event => completedReasoningEvents.push(event));
+  assert.equal(completedReasoningEvents.filter(event => event.text === '公开推理正文').length, 1,
+    'A replayed completed reasoning notification is not emitted twice');
+  projectNotification({ method: 'item/reasoning/textDelta', params: {
+    threadId: 'thread-native', turnId: 'turn-2', itemId: 'reason-streamed', delta: '流式推理',
+  } }, completedReasoningSession, event => completedReasoningEvents.push(event));
+  projectNotification({ method: 'item/completed', params: { threadId: 'thread-native', turnId: 'turn-2', item: {
+    type: 'reasoning', id: 'reason-streamed', summary: [], content: ['流式推理'],
+  } } }, completedReasoningSession, event => completedReasoningEvents.push(event));
+  assert.equal(completedReasoningEvents.filter(event => event.text === '流式推理').length, 1,
+    'Completed reasoning does not repeat an item that already streamed a delta');
+  assert.equal(publicReasoningText({ type: 'reasoning', summary: [], content: [], encrypted_content: 'opaque' }), undefined,
+    'Encrypted reasoning is never decoded or forwarded');
+  assert.equal(publicReasoningText({ type: 'reasoning', summary: [],
+    content: [{ type: 'reasoning_text', text: '公开响应正文' }] }), '公开响应正文',
+  'Public response-item reasoning_text content is accepted without inspecting encrypted content');
+
+  const restoredMessages = nativeChildMessages({ turns: [{ status: 'completed', items: [{
+    type: 'reasoning', id: 'reason-history', summary: [], content: ['历史公开推理'],
+  }] }] });
+  assert.equal(restoredMessages[0].parts[0].type, 'reasoning');
+  assert.equal(restoredMessages[0].parts[0].text, '历史公开推理',
+    'Native history restores public reasoning content when summary is empty');
 
   const childEvents = [];
   const childSession = fakeSession();
@@ -137,6 +175,90 @@ function fakeSession() {
 
   assert.equal(usageView({ last: { totalTokens: 50 }, total: {}, modelContextWindow: 200 }).contextPercent, 25);
   assert.deepEqual(modelView({ model: 'gpt-x', displayName: 'GPT X', supportedReasoningEfforts: [], isDefault: true }).id, 'gpt-x');
+
+  // Profile-backed provider entries are advertised only when their config layer exists.
+  const profileHome = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-mix-codex-profile-'));
+  try {
+    assert.deepEqual(configuredProviderModels(profileHome), [], 'Missing selection file does not advertise an unusable model');
+    fs.writeFileSync(path.join(profileHome, 'deepseek.config.toml'), 'model = "deepseek-flash"\nmodel_provider = "deepseek"\nenv_key = "IGNORED"\n');
+    assert.deepEqual(configuredProviderModels(profileHome), [], 'Provider must also be declared in the main Codex config');
+    fs.writeFileSync(path.join(profileHome, 'config.toml'), '[model_providers.deepseek]\nbase_url = "https://example.invalid"\nenv_key = "IGNORED"\n');
+    const configured = configuredProviderModels(profileHome);
+    assert.deepEqual(configured, [{
+      id: 'deepseek-flash', name: 'DeepSeek · deepseek-flash', provider: 'deepseek', selectionOrigin: 'deepseek-config',
+      description: '通过 deepseek.config.toml 的 model/model_provider 选择 DeepSeek provider',
+      efforts: [
+        { id: 'low', label: 'low', hint: 'Fast responses with lighter reasoning' },
+        { id: 'high', label: 'high', hint: 'Extra high reasoning depth for complex problems' },
+        { id: 'max', label: 'max', hint: 'Maximum reasoning depth for the hardest problems' },
+      ],
+    }]);
+    const dedicatedModels = withConfiguredProviderModels([modelView({
+      model: 'deepseek-flash', displayName: 'DeepSeek-Flash',
+      supportedReasoningEfforts: [
+        { reasoningEffort: 'low', description: 'Fast responses with lighter reasoning' },
+        { reasoningEffort: 'high', description: 'Extra high reasoning depth for complex problems' },
+        { reasoningEffort: 'max', description: 'Maximum reasoning depth for the hardest problems' },
+      ],
+    })], profileHome, modelCatalogJson(configured[0]));
+    assert.equal(dedicatedModels.length, 1, 'Dedicated catalog model and configured-provider entry are merged');
+    assert.equal(dedicatedModels[0].provider, 'deepseek');
+    assert.equal(dedicatedModels[0].selectionOrigin, 'deepseek-config');
+    assert.deepEqual(dedicatedModels[0].efforts.map(entry => entry.id), ['low', 'high', 'max']);
+  } finally { fs.rmSync(profileHome, { recursive: true, force: true }); }
+
+  const deepSeekModel = { id: 'deepseek-flash', name: 'DeepSeek · deepseek-flash', provider: 'deepseek', selectionOrigin: 'deepseek-config' };
+  const deepSeekCatalog = modelCatalogJson(deepSeekModel);
+  assert.ok(deepSeekCatalog.endsWith(path.join('codex-model-catalogs', 'deepseek-flash.json')));
+  const catalogData = JSON.parse(fs.readFileSync(deepSeekCatalog, 'utf8'));
+  const catalogModel = catalogData.models?.find(model => model.slug === 'deepseek-flash');
+  assert.equal(catalogData.models?.length, 1, 'Dedicated catalog contains only DeepSeek-Flash');
+  assert.equal(catalogModel.context_window, 1048576);
+  assert.deepEqual(catalogModel.supported_reasoning_levels.map(entry => entry.effort), ['low', 'high', 'max']);
+  assert.ok(catalogModel.model_messages.instructions_template.startsWith('You are Codex, an agent based on DeepSeek-Flash.'));
+  assert.ok(catalogModel.base_instructions.startsWith('You are Codex, an agent based on DeepSeek-Flash.'));
+  assert.ok(!/agent based on GPT-5/.test(catalogModel.model_messages.instructions_template));
+  assert.equal(modelCatalogJson({ ...deepSeekModel, id: 'other-model' }), undefined);
+  assert.equal(modelCatalogJson({ id: 'deepseek-flash', provider: 'openai' }), undefined);
+  const defaultLaunch = appServerLaunch('codex.exe');
+  assert.deepEqual(defaultLaunch.args, ['app-server', '--listen', 'stdio://'], 'Default Codex launch args remain unchanged');
+  const deepSeekLaunch = appServerLaunch('codex.exe', deepSeekCatalog);
+  assert.deepEqual(deepSeekLaunch.args.slice(0, 3), ['app-server', '--listen', 'stdio://']);
+  assert.deepEqual(deepSeekLaunch.args.slice(3), ['-c', `model_catalog_json='${deepSeekCatalog.replaceAll('\\', '/')}'`]);
+  assert.notEqual(appServerSharedKey(profileHome), appServerSharedKey(profileHome, deepSeekCatalog), 'Catalog-specific app-server uses a separate pool');
+  assert.equal(modelCatalogJson(deepSeekModel), modelCatalogJson({ ...deepSeekModel }), 'Resume and fork select the same catalog from persisted model identity');
+  assert.deepEqual(threadOptions({ cwd: 'E:\\project', options: { model: deepSeekModel } }), {
+    cwd: 'E:\\project', model: 'deepseek-flash', modelProvider: 'deepseek',
+  }, 'thread/start and thread/resume carry the native provider identity');
+  assert.deepEqual(threadOptions({ cwd: 'E:\\project', options: { model: { id: 'gpt-x', provider: 'openai' } } }), {
+    cwd: 'E:\\project', model: 'gpt-x',
+  }, 'Native Codex catalog models do not override the base configured provider');
+  assert.deepEqual(forkOptions({ nativeSessionId: 'native-ds', cwd: 'E:\\project', model: { id: 'runtime-name', provider: 'wrong' }, options: { model: deepSeekModel } }, 'turn-1'), {
+    threadId: 'native-ds', lastTurnId: 'turn-1', cwd: 'E:\\project', model: 'deepseek-flash', modelProvider: 'deepseek',
+  }, 'fork preserves the configured-provider model instead of a lossy runtime alias');
+  assert.deepEqual(forkOptions({ nativeSessionId: 'native-default', cwd: 'E:\\project', model: { id: 'runtime-model', provider: 'chatgpt-http' }, options: { model: { id: 'catalog-alias', provider: 'openai' } } }), {
+    threadId: 'native-default', cwd: 'E:\\project', model: 'runtime-model',
+  }, 'Default-provider fork preserves legacy routing without a provider override');
+  const providerSession = fakeSession();
+  providerSession.selectionOrigin = null;
+  providerSession.model = { id: 'gpt-x', provider: 'chatgpt-http' };
+  providerSession.host = { async request() { throw new Error('must not mutate native thread'); } };
+  await assert.rejects(adapter.setModel(providerSession, deepSeekModel), /创建时固定/, 'Live provider switches fail before native state is modified');
+  const defaultSession = fakeSession();
+  defaultSession.selectionOrigin = null;
+  defaultSession.model = { id: 'gpt-old', provider: 'chatgpt-http' };
+  const defaultUpdates = [];
+  defaultSession.host = { async request(method, params) { defaultUpdates.push({ method, params }); return {}; } };
+  assert.deepEqual(await adapter.setModel(defaultSession, { id: 'gpt-new', name: 'GPT New', provider: 'openai' }), {
+    id: 'gpt-new', name: 'GPT New', provider: 'chatgpt-http',
+  }, 'Default catalog changes preserve the native session provider identity');
+  assert.deepEqual(defaultUpdates, [{ method: 'thread/settings/update', params: { threadId: 'thread-native', model: 'gpt-new' } }]);
+  const changedConfiguredSession = fakeSession();
+  changedConfiguredSession.selectionOrigin = 'deepseek-config';
+  changedConfiguredSession.model = { id: 'deepseek-flash', provider: 'deepseek' };
+  changedConfiguredSession.host = { async request() { throw new Error('must not mutate changed provider'); } };
+  await assert.rejects(adapter.setModel(changedConfiguredSession, { ...deepSeekModel, provider: 'renamed-provider' }), /配置已变化/,
+    'A changed configured provider is rejected before native state is modified');
 
   // Codex 26.917 的 permissionProfile id 带 ':' 前缀（':read-only' 等），必须映射为
   // UI 契约的 [A-Za-z0-9._~-] 安全 id，且发往原生前无损还原。

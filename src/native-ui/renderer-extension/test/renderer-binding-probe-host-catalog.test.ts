@@ -20,7 +20,7 @@ const testState = vi.hoisted(() => ({
   getConnectionDiagnostics: null as null | (() => RendererConnectionDiagnostics | null),
   getSessionImportClient: null as null | (() => RendererSessionImportClient | null),
   documentListeners: new Map<string, EventListener>(),
-  modelTarget: ["conversation", "thread-a"] as readonly unknown[],
+  modelTarget: ["conversation", "thread-a"] as readonly unknown[] | null,
   prepareMentions: vi.fn(),
 }));
 
@@ -419,6 +419,47 @@ describe("Renderer binding Host-scoped Claude catalogs", () => {
       target: testState.composer, preventDefault, stopImmediatePropagation: vi.fn(),
     } as unknown as Event);
     expect(applyAgent).toHaveBeenCalledWith("codex", undefined, undefined, undefined, testState.composer);
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("lets an official Codex draft with a missing model target use the native submit route", async () => {
+    installFakeBrowser();
+    testState.modelTarget = null;
+    const select = vi.fn();
+    Object.assign(window, {
+      __harnessmixSidecarModeV1: true,
+      __harnessmixDraftPrewarmPolicyV1: {
+        state: "ready",
+        hostId: "local",
+        requestTarget: () => ({}),
+        select,
+        selectAccount: vi.fn(),
+        clear: vi.fn(async () => undefined),
+      },
+    });
+    const { installRendererBindingProbe } = await import("../src/renderer-binding-probe.js");
+    const probe = installRendererBindingProbe({
+      enabledAgents: ["codex", "claude-code"], defaultAgent: "codex",
+    });
+    probe.setAdapter(
+      { state: "ready", reason: "ready", modelUpdates: 0, hook: "request-bridge" },
+      undefined, () => false,
+    );
+
+    expect(probe.status().selections[0]).toMatchObject({
+      agent: "codex",
+      phase: "draft",
+      modelTarget: null,
+      hostId: null,
+      stockCodexAccount: true,
+      preliminarySubmissionBlock: null,
+    });
+    const preventDefault = vi.fn();
+    testState.documentListeners.get("submit")?.({
+      target: testState.composer, preventDefault, stopImmediatePropagation: vi.fn(),
+    } as unknown as Event);
+
+    expect(select).toHaveBeenCalledWith(null);
     expect(preventDefault).not.toHaveBeenCalled();
   });
 

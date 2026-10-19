@@ -332,6 +332,14 @@ export interface RendererBindingProbeStatus {
     composerId: string;
     agent: RendererAgent;
     phase: ComposerAgentPhase;
+    modelTarget: {
+      kind: string;
+      arity: number;
+      writable: boolean;
+    } | null;
+    hostId: string | null;
+    stockCodexAccount: boolean | null;
+    preliminarySubmissionBlock: string | null;
   }>;
   adapter: RendererAdapterStatus;
 }
@@ -3163,7 +3171,30 @@ export function installRendererBindingProbe(
     if (mounted?.modelTarget?.[0] === "conversation") {
       return state.phase === "locked" && mounted.ownershipStatus === "ready";
     }
-    if (!mounted || !isComposerModelWriteAllowed(mounted.modelTarget)) return false;
+    if (!mounted) return false;
+    if (!isComposerModelWriteAllowed(mounted.modelTarget)) {
+      if (
+        mounted.modelTarget === null &&
+        state.phase === "draft" &&
+        state.agent === "codex" &&
+        isStockCodexAccountId(state.codexAccountId)
+      ) {
+        // Newer Desktop builds can keep a native Codex draft sendable while
+        // its model target is temporarily absent. The official account owns
+        // that route, so let Desktop submit it directly. Isolated Codex
+        // accounts still pass through authorizeSubmission below, where their
+        // request-target and account-route guards remain fail closed.
+        const policy = window.__harnessmixDraftPrewarmPolicyV1;
+        if (!policy) return true;
+        try {
+          policy.select(null);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    }
     const model = controller.modelForAgent(composer, state.agent);
     if (!shouldApplyDraftAgentCarrier(state.agent, model)) return false;
     const applied = applyComposerModelWrite(
@@ -3454,33 +3485,82 @@ export function installRendererBindingProbe(
 
   const api: RendererBindingProbeApi = {
     status() {
-      const selections = liveComposers().map((mounted) => ({
-        composerId: mounted.composerId,
-        agent: controller.get(mounted.composer).agent,
-        phase: controller.get(mounted.composer).phase,
-        // Live debugging surface: the raw external model/permission views plus
-        // the selection refs held by the controller.
-        ownership: mounted.ownershipStatus,
-        modelView: {
-          status: mounted.modelView.status,
-          ...(mounted.modelView.catalog
-            ? { catalogModels: mounted.modelView.catalog.models.map((m) => m.ref.id.slice(0, 24)) }
+      const selections = liveComposers().map((mounted) => {
+        const selection = controller.get(mounted.composer);
+        const targetKind = mounted.modelTarget?.[0];
+        const modelTarget = mounted.modelTarget === null
+          ? null
+          : {
+              kind: typeof targetKind === "string" ? targetKind.slice(0, 32) : typeof targetKind,
+              arity: mounted.modelTarget.length,
+              writable: isComposerModelWriteAllowed(mounted.modelTarget),
+            };
+        const stockCodexAccount = selection.agent === "codex"
+          ? isStockCodexAccountId(selection.codexAccountId)
+          : null;
+        // This reports stable preflight gates only. Adapter writes and policy
+        // account selection still run at submission time and may fail closed.
+        const preliminarySubmissionBlock = ((): string | null => {
+          if (codexAccountsForComposer(mounted.composer)?.switching) return "account-switching";
+          if (controller.isSwitching(mounted.composer) || mounted.harnessSwitching) {
+            return "agent-switching";
+          }
+          if (isOwnershipSubmissionBlocked(mounted.ownershipStatus)) {
+            return `ownership-${mounted.ownershipStatus}`;
+          }
+          if (!externalConfigurationReady(mounted)) return "external-configuration";
+          if (selection.phase === "locked") return null;
+          if (
+            mounted.modelTarget === null &&
+            selection.agent === "codex" &&
+            stockCodexAccount
+          ) {
+            return null;
+          }
+          if (!isComposerModelWriteAllowed(mounted.modelTarget)) return "model-target-unwritable";
+          if (
+            !shouldApplyDraftAgentCarrier(
+              selection.agent,
+              controller.modelForAgent(mounted.composer, selection.agent),
+            )
+          ) {
+            return "model-unselected";
+          }
+          return null;
+        })();
+        return {
+          composerId: mounted.composerId,
+          agent: selection.agent,
+          phase: selection.phase,
+          modelTarget,
+          hostId: mounted.hostId,
+          stockCodexAccount,
+          preliminarySubmissionBlock,
+          // Live debugging surface: the raw external model/permission views plus
+          // the selection refs held by the controller.
+          ownership: mounted.ownershipStatus,
+          modelView: {
+            status: mounted.modelView.status,
+            ...(mounted.modelView.catalog
+              ? { catalogModels: mounted.modelView.catalog.models.map((m) => m.ref.id.slice(0, 24)) }
+              : {}),
+            ...(mounted.modelView.selected
+              ? { selected: mounted.modelView.selected.id.slice(0, 24) }
+              : {}),
+            ...(mounted.modelView.error ? { error: mounted.modelView.error.slice(0, 160) } : {}),
+          },
+          ...(selection.phase === "locked" && mounted.composerId
+            ? {
+                controllerModel: ((): string | undefined => {
+                  if (selection.agent === "codex") return undefined;
+                  const model = controller.modelForAgent(mounted.composer, selection.agent);
+                  return model ? model.id.slice(0, 24) : undefined;
+                })(),
+              }
             : {}),
-          ...(mounted.modelView.selected ? { selected: mounted.modelView.selected.id.slice(0, 24) } : {}),
-          ...(mounted.modelView.error ? { error: mounted.modelView.error.slice(0, 160) } : {}),
-        },
-        ...(controller.get(mounted.composer).phase === "locked" && mounted.composerId
-          ? {
-              controllerModel: ((): string | undefined => {
-                const agent = controller.get(mounted.composer).agent;
-                if (agent === "codex") return undefined;
-                const model = controller.modelForAgent(mounted.composer, agent);
-                return model ? model.id.slice(0, 24) : undefined;
-              })(),
-            }
-          : {}),
-        permissionView: mounted.permissionModeView.status,
-      }));
+          permissionView: mounted.permissionModeView.status,
+        };
+      });
       return {
         version: 2,
         mountedComposers: selections.length,

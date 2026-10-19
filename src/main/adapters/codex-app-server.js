@@ -1,6 +1,35 @@
 const { JsonlProcess, cliSpawn } = require('../host/jsonl');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const shared = new Map();
+
+function resolvedOptionalPath(value, label) {
+  if (!value) return null;
+  const resolved = path.resolve(value);
+  if (!fs.statSync(resolved).isFile()) throw new Error(`${label} 不是文件: ${resolved}`);
+  return resolved;
+}
+
+function appServerSharedKey(codexHome, modelCatalogJson) {
+  const home = codexHome ? path.resolve(codexHome).toLowerCase() : '<default>';
+  const catalog = modelCatalogJson ? path.resolve(modelCatalogJson).toLowerCase() : '<default-catalog>';
+  return `${home}\u0000${catalog}`;
+}
+
+function appServerLaunch(executable, modelCatalogJson) {
+  const catalogPath = modelCatalogJson?.replaceAll('\\', '/');
+  if (catalogPath?.includes("'")) throw new Error('Codex model catalog 路径不能包含单引号');
+  // TOML literal string avoids backslash escaping on Windows and survives the
+  // cmd.exe shim used by cliSpawn (double quotes are shell syntax there).
+  const override = catalogPath ? ['-c', `model_catalog_json='${catalogPath}'`] : [];
+  return executable
+    ? { command: executable, args: ['app-server', '--listen', 'stdio://', ...override] }
+    : (() => {
+        const launch = cliSpawn('codex', ['app-server', '--stdio', ...override]);
+        return { command: launch.command, args: launch.args };
+      })();
+}
 
 // codex 拒绝在缺失的 CODEX_HOME 下启动、或握手被外部因素（杀软扫描/磁盘/版本握手）挂住时，
 // initialize 永不返回。没有这个上限，thread/start 会永久 pending，Desktop 端表现为
@@ -16,16 +45,17 @@ function handshakeTimeoutMs() {
  * traffic to the Adapter session that registered the native thread id.
  */
 class CodexAppServer {
-  constructor(diagnostic, codexHome) {
+  constructor(diagnostic, codexHome, modelCatalogJson) {
     this.refs = 0;
     this.routes = new Map();
     this.notifications = new Set();
     this.diagnostics = new Set(diagnostic ? [diagnostic] : []);
     this.closed = false;
-    this.codexHome = codexHome ? require('node:path').resolve(codexHome) : null;
+    this.codexHome = codexHome ? path.resolve(codexHome) : null;
+    this.modelCatalogJson = resolvedOptionalPath(modelCatalogJson, 'Codex model catalog');
     // The Desktop-bundled CLI and the PATH CLI can be different versions.
     const executable = process.env.HARNESS_MIX_CODEX_EXECUTABLE || process.env.HARNESSMIX_STOCK_CODEX_PATH;
-    const { command, args } = executable ? { command: executable, args: ['app-server', '--listen', 'stdio://'] } : cliSpawn('codex', ['app-server', '--stdio']);
+    const { command, args } = appServerLaunch(executable, this.modelCatalogJson);
     const env = { ...process.env, ...(this.codexHome ? { CODEX_HOME: this.codexHome } : {}) };
     this.process = new JsonlProcess(command, args, { env }, {
       onEvent: (message) => this.#notification(message),
@@ -56,11 +86,12 @@ class CodexAppServer {
     ]).finally(() => clearTimeout(handshakeTimer));
   }
 
-  static async acquire(diagnostic, codexHome) {
-    const key = codexHome ? require('node:path').resolve(codexHome).toLowerCase() : '<default>';
+  static async acquire(diagnostic, codexHome, modelCatalogJson) {
+    const resolvedCatalog = resolvedOptionalPath(modelCatalogJson, 'Codex model catalog');
+    const key = appServerSharedKey(codexHome, resolvedCatalog);
     let server = shared.get(key);
     if (!server || server.closed) {
-      server = new CodexAppServer(diagnostic, codexHome);
+      server = new CodexAppServer(diagnostic, codexHome, resolvedCatalog);
       server.sharedKey = key;
       shared.set(key, server);
     } else if (diagnostic) server.diagnostics.add(diagnostic);
@@ -141,4 +172,4 @@ class CodexAppServer {
   }
 }
 
-module.exports = { CodexAppServer };
+module.exports = { CodexAppServer, appServerLaunch, appServerSharedKey };

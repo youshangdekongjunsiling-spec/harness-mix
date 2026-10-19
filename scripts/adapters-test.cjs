@@ -23,6 +23,40 @@ for (const adapter of adapters) {
   });
 }
 
+{
+  const { projectApproval, toPermissionResult } = require('../src/main/adapters/claude');
+  const input = { questions: [
+    { header: 'Runtime', question: 'Which runtime?', options: [{ label: 'Node', description: 'Node.js' }, { label: 'Bun', description: 'Bun' }], multiSelect: false },
+    { header: 'Features', question: 'Which features?', options: [{ label: 'Lint', description: 'Linting' }, { label: 'Test', description: 'Tests' }], multiSelect: true },
+  ] };
+  test('[claude] AskUserQuestion projects native questions instead of permission decisions', () => {
+    const projected = projectApproval('ask-1', 'AskUserQuestion', input);
+    assert.equal(projected.method, 'input');
+    assert.deepEqual(projected.questions.map(q => ({ id: q.id, multiple: q.multiple, options: q.options })), [
+      { id: 'question_0', multiple: false, options: [{ label: 'Node', description: 'Node.js' }, { label: 'Bun', description: 'Bun' }] },
+      { id: 'question_1', multiple: true, options: [{ label: 'Lint', description: 'Linting' }, { label: 'Test', description: 'Tests' }] },
+    ]);
+  });
+  test('[claude] AskUserQuestion returns all answers in the SDK input shape', () => {
+    assert.deepEqual(toPermissionResult({ toolName: 'AskUserQuestion', input }, {
+      answers: { 'Which runtime?': 'Node', 'Which features?': 'Lint, Test' },
+    }), { behavior: 'allow', updatedInput: { ...input, answers: { 'Which runtime?': 'Node', 'Which features?': 'Lint, Test' } } });
+  });
+  test('[claude] cancelled or incomplete questions deny and interrupt without becoming approval', () => {
+    assert.deepEqual(toPermissionResult({ toolName: 'AskUserQuestion', input }, { cancelled: true }),
+      { behavior: 'deny', message: '用户取消了请求', interrupt: true });
+    assert.deepEqual(toPermissionResult({ toolName: 'AskUserQuestion', input }, { answers: { 'Which runtime?': 'Node' } }),
+      { behavior: 'deny', message: '用户取消了请求', interrupt: true });
+    assert.deepEqual(toPermissionResult({ toolName: 'AskUserQuestion', input }, { value: 'Node' }),
+      { behavior: 'deny', message: '用户取消了请求', interrupt: true }, '旧 Host 单值不能静默漏答多题');
+  });
+  test('[claude] real tool permissions keep allow/deny semantics', () => {
+    const permission = { toolName: 'Bash', input: { command: 'npm test' }, suggestions: [{ type: 'setMode' }] };
+    assert.deepEqual(toPermissionResult(permission, { confirmed: false }), { behavior: 'deny', message: '用户拒绝了该操作' });
+    assert.deepEqual(toPermissionResult(permission, { optionId: 'allow' }), { behavior: 'allow', updatedInput: permission.input });
+  });
+}
+
 // Pi 家族权限目录按成员原生面分开（诚实面）：Pi=项目信任旗标，OMP=--approval-mode 三档。
 // 实测依据：pi 0.84.2 `pi --help`（--approve/-a、--no-approve/-na）；
 // @oh-my-pi/pi-coding-agent 18.1.19 flag-tables.ts/settings-schema.ts（always-ask|write|yolo）。

@@ -237,6 +237,7 @@ class EventNormalizer {
         title: legacy.title,
         message: legacy.message,
         options: legacy.options,
+        questions: legacy.questions,
         placeholder: legacy.placeholder,
         interactionStatus: 'pending',
       },

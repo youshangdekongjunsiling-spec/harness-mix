@@ -481,6 +481,40 @@ describe("current Codex Renderer Agent adapter", () => {
     expect(findComposerModelTarget(composer)).toBeNull();
   });
 
+  it("recognizes the newer fourteen-slot route-derived draft", () => {
+    const draftSettings = {
+      modelSettings: null,
+      isManuallyChanged: false,
+      serviceTier: null,
+    };
+    const updateDraftSettings = vi.fn();
+    const result = { draftSettings, isNewThreadDraft: true, updateDraftSettings };
+    const slots = [
+      "/",
+      "",
+      "new-conversation",
+      "client-new-thread:new",
+      "new-conversation",
+      undefined,
+      "client-new-thread:new",
+      "client-new-thread:new",
+      {},
+      updateDraftSettings,
+      draftSettings,
+      true,
+      updateDraftSettings,
+      result,
+    ];
+    const composer = composerWithFiber({
+      updateQueue: { memoCache: { data: [slots] } },
+      return: null,
+    });
+
+    expect(findComposerModelTarget(composer)).toEqual(["default", "client-new-thread:new"]);
+    slots[13] = { ...result, updateDraftSettings: vi.fn() };
+    expect(findComposerModelTarget(composer)).toBeNull();
+  });
+
   it("finds the current seven-slot new Thread draft identity", () => {
     const wrapper = { isManuallyChanged: false, modelSettings: null, serviceTier: null };
     const draftAtom = { get: vi.fn(() => wrapper) };

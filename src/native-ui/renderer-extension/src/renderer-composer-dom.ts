@@ -92,6 +92,7 @@ export interface ComposerAgentControl {
   modelPicker: RendererModelPickerControl;
   permissionModePicker: RendererPermissionModePickerControl;
   nativeModelControl: NativeModelControlState | null;
+  nativeModelControls?: NativeModelControlState[];
   nativePermissionModeControl: NativePermissionModeControlState | null;
   nativeContextUsageControl?: HiddenControlSnapshot | null;
   nativePermissionModeControlVerified: boolean;
@@ -338,11 +339,16 @@ function verifiedPermissionControlIn(composer: Element): HTMLElement | null {
   return candidate && isNativePermissionModeControlCandidate(candidate) ? candidate : null;
 }
 
-function verifiedModelControlIn(composer: Element): HTMLElement | null {
-  const candidates = [
+function nativeModelControlsIn(composer: Element): HTMLElement[] {
+  return [
     ...composer.querySelectorAll<HTMLElement>('button[aria-haspopup="menu"]'),
-  ].filter((element) => isNativeModelControlCandidate(element));
-  return candidates.length === 1 ? (candidates[0] ?? null) : null;
+  ].filter(
+    (element) =>
+      !isRendererOwnedControl(element) &&
+      (isNativeModelControlCandidate(element) ||
+        element.getAttribute("data-codex-intelligence-trigger") === "true" ||
+        element.getAttribute("data-composer-navigation-target") === "reasoning"),
+  );
 }
 
 export function isNativeContextUsageControlCandidate(element: Element): boolean {
@@ -459,14 +465,36 @@ function retargetContextUsageControl(control: ComposerAgentControl): void {
   control.nativeContextUsageControl = snapshotNativeControl(candidate);
 }
 
-function retargetModelControl(control: ComposerAgentControl): void {
-  const candidate = verifiedModelControlIn(control.composer);
-  if (!candidate) return;
-  if (candidate !== control.nativeModelControl?.element) {
-    restoreNativeControl(control.nativeModelControl);
-    control.nativeModelControl = snapshotNativeControl(candidate);
+function retargetModelControls(control: ComposerAgentControl): void {
+  const candidates = nativeModelControlsIn(control.composer);
+  const previousSnapshots =
+    control.nativeModelControls ??
+    (control.nativeModelControl ? [control.nativeModelControl] : []);
+  const snapshotsByElement = new Map(
+    previousSnapshots.map((snapshot) => [snapshot.element, snapshot]),
+  );
+  const nextSnapshots = candidates.map(
+    (candidate) => snapshotsByElement.get(candidate) ?? snapshotNativeControl(candidate)!,
+  );
+  for (const snapshot of previousSnapshots) {
+    if (!candidates.includes(snapshot.element)) restoreNativeControl(snapshot);
+  }
+  const previousPrimary = control.nativeModelControl?.element ?? null;
+  control.nativeModelControls = nextSnapshots;
+  control.nativeModelControl = nextSnapshots[0] ?? null;
+  if ((control.nativeModelControl?.element ?? null) !== previousPrimary) {
     syncRendererModelTriggerClass(control.modelPicker);
   }
+}
+
+function setNativeModelControlsHidden(
+  control: ComposerAgentControl,
+  hidden: boolean,
+): void {
+  const snapshots =
+    control.nativeModelControls ??
+    (control.nativeModelControl ? [control.nativeModelControl] : []);
+  for (const snapshot of snapshots) setNativeControlHidden(snapshot, hidden);
 }
 
 function usagePlacementAnchor(control: ComposerAgentControl): HTMLElement | null {
@@ -592,14 +620,14 @@ export function reconcileComposerNativeControls(
   hidePermissionMode: boolean,
 ): void {
   retargetContextUsageControl(control);
-  retargetModelControl(control);
+  retargetModelControls(control);
   // Place the permission-mode picker before Credits anchors against it, so
   // Credits never latches onto a stale mount-time position within this pass.
   retargetPermissionModeControl(control);
   repositionTrailingCluster(control);
   repositionUsage(control);
   repositionCredits(control);
-  setNativeControlHidden(control.nativeModelControl, hideModel);
+  setNativeModelControlsHidden(control, hideModel);
   // Context usage is shared: external Usage data is projected into the same
   // native indicator, so it stays visible while the Model control is swapped.
   setNativeControlHidden(control.nativeContextUsageControl, false);
@@ -621,7 +649,10 @@ export function mountComposerAgentControl(
   onSelectCommand: (command: HarnessCommandDescriptor) => void,
   onConfirmHandoff: (request: RendererHarnessHandoffRequest) => void,
 ): ComposerAgentControl {
-  const nativeModelControl = snapshotNativeControl(verifiedModelControlIn(composer));
+  const nativeModelControls = nativeModelControlsIn(composer)
+    .map(snapshotNativeControl)
+    .filter((snapshot): snapshot is HiddenControlSnapshot => snapshot !== null);
+  const nativeModelControl = nativeModelControls[0] ?? null;
   const nativeContextUsageControl = snapshotNativeControl(
     nativeContextUsageControlForComposer(composer),
   );
@@ -668,6 +699,7 @@ export function mountComposerAgentControl(
     modelPicker,
     permissionModePicker,
     nativeModelControl,
+    nativeModelControls,
     nativePermissionModeControl,
     nativeContextUsageControl,
     nativePermissionModeControlVerified,
@@ -792,7 +824,11 @@ export function disposeComposerAgentControl(control: ComposerAgentControl): void
   if (control.sendDisabledBeforeSwitch !== null) {
     control.sendButton.disabled = control.sendDisabledBeforeSwitch;
   }
-  restoreNativeControl(control.nativeModelControl);
+  for (const snapshot of
+    control.nativeModelControls ??
+    (control.nativeModelControl ? [control.nativeModelControl] : [])) {
+    restoreNativeControl(snapshot);
+  }
   restoreNativeControl(control.nativeContextUsageControl);
   restoreNativeControl(control.nativePermissionModeControl);
   control.credits.dispose();

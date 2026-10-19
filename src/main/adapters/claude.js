@@ -197,12 +197,24 @@ function usageFromResult(event, planLimit) {
 /** canUseTool → Host 审批卡片；AskUserQuestion → 选项提问卡片 */
 function projectApproval(requestId, toolName, input, suggestions) {
   if (toolName === "AskUserQuestion") {
-    const question = (Array.isArray(input?.questions) ? input.questions : [])[0] ?? {};
+    const questions = (Array.isArray(input?.questions) ? input.questions : []).map((question, index) => ({
+      id: `question_${index}`,
+      header: question.header || 'Claude',
+      question: question.question || 'Claude 提问',
+      options: (Array.isArray(question.options) ? question.options : []).map((option) => ({
+        label: String(option.label),
+        description: option.description == null ? String(option.label) : String(option.description),
+      })),
+      multiple: question.multiSelect === true,
+      isOther: true,
+      isSecret: false,
+    }));
+    const first = questions[0] ?? {};
     return {
-      kind: "approval", requestId, method: undefined,
-      title: question.header || question.question || "Claude 提问",
-      message: question.question,
-      options: (Array.isArray(question.options) ? question.options : []).map((o) => ({ id: String(o.label), label: String(o.label), hint: o.description })),
+      kind: "approval", requestId, method: 'input',
+      title: first.header || first.question || "Claude 提问",
+      message: first.question,
+      questions,
     };
   }
   return {
@@ -222,9 +234,21 @@ function toPermissionResult(pending, response) {
   const { toolName, input, suggestions } = pending;
   if (response?.cancelled) return { behavior: "deny", message: "用户取消了请求", interrupt: true };
   if (toolName === "AskUserQuestion") {
-    const question = (Array.isArray(input?.questions) ? input.questions : [])[0] ?? {};
+    const questions = Array.isArray(input?.questions) ? input.questions : [];
+    const supplied = response?.answers;
+    if (supplied && typeof supplied === 'object' && !Array.isArray(supplied)) {
+      const answers = {};
+      for (const question of questions) {
+        const answer = supplied[question.question];
+        if (typeof answer !== 'string' || !answer) return { behavior: "deny", message: "用户取消了请求", interrupt: true };
+        answers[question.question] = answer;
+      }
+      return { behavior: "allow", updatedInput: { ...input, answers } };
+    }
+    // 兼容旧 Host 的单题 response.value / response.optionId 形状。
+    const question = questions[0] ?? {};
     const answer = response?.optionId ?? response?.value;
-    if (answer == null) return { behavior: "deny", message: "用户未作答" };
+    if (questions.length !== 1 || answer == null || answer === '') return { behavior: "deny", message: "用户取消了请求", interrupt: true };
     return { behavior: "allow", updatedInput: { ...input, answers: { [question.question ?? "question"]: String(answer) } } };
   }
   const choice = response?.optionId ?? (response?.confirmed === false ? "deny" : "allow");
@@ -331,12 +355,17 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
     pendingApprovals: new Map(),
     // 注意：runtime 以浅拷贝保存 adapter session（{ adapter, ...session }），
     // 泵写入的可变状态必须放在共享引用的 state 容器内，拷贝内外才一致。
-    state: { turn: null, crashed: false, lastUsage: undefined, latestPlanLimit: undefined, checkpointId: undefined,
+    state: { turn: null, crashed: false, closed: false, lastUsage: undefined, latestPlanLimit: undefined, checkpointId: undefined,
       nativeChildren: new Map() },
   };
 
   // Host 侧投影异常绝不能杀死原生事件泵：crashed 只保留给真正的原生流错误。
-  const safeEmit = (mapped) => { try { emit(mapped); } catch { /* host projection must not kill the native pump */ } };
+  // close() 后旧 query 仍可能有已经进入 JS 调度队列的事件；这些事件属于已取消的
+  // 原生回合，绝不能落到恢复后的新 Host Turn 上。
+  const safeEmit = (mapped) => {
+    if (session.state.closed) return;
+    try { emit(mapped); } catch { /* host projection must not kill the native pump */ }
+  };
 
   const syncNativeChildren = async () => {
     if (typeof sdk.getSubagentMessages !== 'function') return;
@@ -392,6 +421,7 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
         }] }],
       },
       canUseTool: (toolName, toolInput, { signal, suggestions }) => {
+        if (session.state.closed) return { behavior: 'deny', message: '会话已中断' };
         if (toolName !== 'AskUserQuestion') {
           const currentMode = normalizeClaudePermissionMode(session.permissionMode);
           if (currentMode === 'bypassPermissions' || session.isWorker) {
@@ -437,16 +467,20 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
           continue;
         }
         if (event.type === "result") {
+          const turn = session.state.turn;
           const usage = usageFromResult(event, session.state.latestPlanLimit);
           if (usage) session.state.lastUsage = usage;
           session.state.checkpointId = event.user_message_uuid ?? session.state.checkpointId;
           for (const mapped of projectEvent(event)) {
+            // Host 在 cancel() 入口已经把该回合结算为 cancelled。interrupt 的控制响应
+            // 早于 result 到达时，迟到的 error/completed 不得击中后续 Host Turn。
+            if (turn?.cancelled && (mapped.kind === 'error' || mapped.kind === 'completed')) continue;
             // 结算事件携带原生检查点（assistant uuid），供 fork 边界定位
             if (mapped.kind === 'completed') mapped.nativeRef = { ...mapped.nativeRef, checkpointId: session.state.checkpointId };
             safeEmit(mapped);
           }
-          session.state.turn?.resolve();
-          session.state.turn = null;
+          turn?.resolve();
+          if (session.state.turn === turn) session.state.turn = null;
           continue;
         }
         if (event.type === 'assistant' && event.uuid) session.state.checkpointId = event.uuid;
@@ -529,7 +563,8 @@ function create() {
     },
 
     async send(session, text, _hooks, attachments) {
-      if (!session.query || session.state?.crashed) throw new Error("Claude 原生会话不可用");
+      if (!session.query || session.state?.crashed || session.state?.closed) throw new Error("Claude 原生会话不可用");
+      if (session.state.turn) throw new Error('Claude 当前回合尚未结束');
       // stream-json 原生内容块：text + base64 图片块；文本附件由 Host 内联进 text
       const content = [
         ...(text ? [{ type: "text", text }] : []),
@@ -546,19 +581,28 @@ function create() {
     },
 
     async cancel(session) {
+      // 先关投影门，再等待 interrupt 控制响应。Host 已经把 Core Turn 结算为
+      // cancelled，这段窗口里的任何旧 assistant/tool/approval 都属于旧回合。
+      session.state.closed = true;
+      clearInterval(session.childPoll);
       for (const pending of session.pendingApprovals?.values() ?? []) {
         pending.resolve({ behavior: "deny", message: "用户取消了请求", interrupt: true });
       }
       session.pendingApprovals?.clear();
-      // 原生优雅中断；超时后由 Host 走 close 兜底
+      const turn = session.state.turn;
+      if (turn) turn.cancelled = true;
+      // SDK interrupt() 的 Promise 只代表 control_response 已返回，不代表旧回合的
+      // result/stream event 已排空。关闭 query 才提供“此后不再接收消息”的隔离边界；
+      // Runtime 收到 discardSession 后会用同一 nativeSessionId 惰性恢复新 query。
       await Promise.race([
         session.query?.interrupt().catch(() => {}),
-        new Promise((r) => setTimeout(r, 2_000)),
+        new Promise((r) => setTimeout(r, 750)),
       ]);
-      if (session.state.turn) {
-        session.state.turn.resolve();
-        session.state.turn = null;
-      }
+      session.input?.end();
+      try { session.query?.close(); } catch { /* force-close is best effort */ }
+      if (session.state.turn === turn) session.state.turn = null;
+      turn?.resolve();
+      return { discardSession: true };
     },
 
     async listCommands(session) {
@@ -660,6 +704,7 @@ function create() {
         pending.resolve({ behavior: "deny", message: "会话已关闭" });
       }
       session.pendingApprovals?.clear();
+      session.state.closed = true;
       session.input?.end();
       try { session.query?.close(); } catch { /* already gone */ }
     },
@@ -673,6 +718,8 @@ module.exports = {
   projectEvent,
   spawnSession,
   nativeSubagentMessages,
+  projectApproval,
+  toPermissionResult,
   resolveCmdShim,
   resolveClaudeExecutable,
 };

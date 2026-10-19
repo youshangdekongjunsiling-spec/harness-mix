@@ -1,4 +1,7 @@
 const { execFile } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { CodexAppServer } = require('./codex-app-server');
 const { cliSpawn } = require('../host/jsonl');
 const { recordNative } = require('../harness-adapter/fixture-recorder');
@@ -20,6 +23,91 @@ const manifest = {
 };
 
 const MAX_TOOL_TEXT = 24_000;
+
+const CONFIGURED_PROVIDER_FILES = [{ file: 'deepseek.config.toml', label: 'DeepSeek', origin: 'deepseek-config' }];
+const DEEPSEEK_FLASH_CATALOG = path.join(__dirname, 'codex-model-catalogs', 'deepseek-flash.json');
+const SAFE_PROVIDER_ID = /^[A-Za-z0-9._-]+$/;
+const SAFE_MODEL_ID = /^[A-Za-z0-9._:/-]+$/;
+
+function modelCatalogJson(model) {
+  return model?.selectionOrigin === 'deepseek-config' && model.id === 'deepseek-flash'
+    ? DEEPSEEK_FLASH_CATALOG
+    : undefined;
+}
+
+function configuredModelEfforts(model) {
+  const catalog = modelCatalogJson(model);
+  if (!catalog) return [];
+  const metadata = require(catalog).models?.find(entry => entry.slug === model.id);
+  return (metadata?.supported_reasoning_levels ?? []).map(entry => ({
+    id: entry.effort,
+    label: entry.effort,
+    hint: entry.description,
+  }));
+}
+
+function effectiveCodexHome(codexHome) {
+  return path.resolve(codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+}
+
+function topLevelTomlStrings(file, keys) {
+  const result = {};
+  let inTable = false;
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    if (trimmed.startsWith('[')) { inTable = true; continue; }
+    if (inTable) continue;
+    const match = /^([A-Za-z0-9_-]+)\s*=\s*(?:"([^"\\]*)"|'([^']*)')\s*(?:#.*)?$/.exec(trimmed);
+    if (match && keys.has(match[1])) result[match[1]] = match[2] ?? match[3];
+  }
+  return result;
+}
+
+function providerDeclared(file, provider) {
+  if (!SAFE_PROVIDER_ID.test(provider) || !fs.existsSync(file)) return false;
+  const escaped = provider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const section = new RegExp(`^\\[model_providers\\.(?:${escaped}|"${escaped}"|'${escaped}')\\]\\s*(?:#.*)?$`);
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/).some(line => section.test(line.trim()));
+}
+
+function configuredProviderModels(codexHome) {
+  const home = effectiveCodexHome(codexHome);
+  const models = [];
+  for (const source of CONFIGURED_PROVIDER_FILES) {
+    const file = path.join(home, source.file);
+    if (!fs.existsSync(file)) continue;
+    const selected = topLevelTomlStrings(file, new Set(['model', 'model_provider']));
+    if (!SAFE_MODEL_ID.test(selected.model ?? '') || !SAFE_PROVIDER_ID.test(selected.model_provider ?? '')) continue;
+    if (!providerDeclared(path.join(home, 'config.toml'), selected.model_provider)) continue;
+    const model = {
+      id: selected.model,
+      name: `${source.label} · ${selected.model}`,
+      provider: selected.model_provider,
+      selectionOrigin: source.origin,
+      description: `通过 ${source.file} 的 model/model_provider 选择 ${source.label} provider`,
+    };
+    model.efforts = configuredModelEfforts(model);
+    models.push(model);
+  }
+  return models;
+}
+
+function withConfiguredProviderModels(models, codexHome, activeCatalogJson) {
+  const result = [...models];
+  for (const model of configuredProviderModels(codexHome)) {
+    const configuredCatalog = modelCatalogJson(model);
+    const catalogIndex = configuredCatalog && activeCatalogJson && path.resolve(configuredCatalog) === path.resolve(activeCatalogJson)
+      ? result.findIndex(entry => entry.id === model.id)
+      : -1;
+    if (catalogIndex >= 0) {
+      result[catalogIndex] = { ...result[catalogIndex], ...model };
+    } else if (!result.some(entry => entry.id === model.id && entry.provider === model.provider)) {
+      result.push(model);
+    }
+  }
+  return result;
+}
 
 // Codex 26.917 起 permissionProfile/list 返回带 ':' 前缀的档案 id（如 ':read-only'），
 // 而渲染层契约要求 permission mode id 只能是 [A-Za-z0-9._~-] 且不超过 128 字符。
@@ -182,6 +270,23 @@ function emitTool(item, session, emit, state = toolState(item)) {
   });
 }
 
+function publicReasoningText(item) {
+  if (item?.type !== 'reasoning') return undefined;
+  const summary = (Array.isArray(item.summary) ? item.summary : [])
+    .map(part => typeof part === 'string' ? part : part?.text)
+    .filter(part => typeof part === 'string' && part.length);
+  if (summary.length) return summary.join('\n');
+  const content = (Array.isArray(item.content) ? item.content : [])
+    .map(part => {
+      if (typeof part === 'string') return part;
+      if (part?.type === 'reasoning_text' || part?.type === 'text') return part.text;
+      return undefined;
+    })
+    .filter(part => typeof part === 'string' && part.length);
+  if (content.length) return content.join('\n');
+  return typeof item.text === 'string' && item.text.length ? item.text : undefined;
+}
+
 function nativeChildMessages(thread) {
   const messages = [];
   for (const turn of thread?.turns ?? []) {
@@ -194,8 +299,8 @@ function nativeChildMessages(thread) {
       } else if (item.type === 'agentMessage') {
         assistantParts.push({ type: 'text', text: item.text ?? '' });
       } else if (item.type === 'reasoning') {
-        const summary = Array.isArray(item.summary) ? item.summary.join('\n') : item.text;
-        if (summary) assistantParts.push({ type: 'reasoning', text: summary });
+        const reasoning = publicReasoningText(item);
+        if (reasoning) assistantParts.push({ type: 'reasoning', text: reasoning });
       } else if (['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall'].includes(item.type)) {
         assistantParts.push({ type: 'tool', callID: item.id, tool: toolTitle(item),
           state: { status: toolState(item) === 'error' ? 'error' : 'completed', input: toolInput(item), output: toolOutput(item) } });
@@ -288,9 +393,13 @@ function projectNotification(message, session, emit) {
       recordNativeChildren(item, session);
       if (item?.type === 'agentMessage' && !session.state.itemText.has(item.id) && item.text) {
         emit({ kind: 'text-delta', text: item.text, nativeRef });
-      } else if (item?.type === 'reasoning' && Array.isArray(item.summary) && item.summary.length) {
+      } else if (item?.type === 'reasoning') {
         // Older app-server versions may send only the completed reasoning item.
-        if (!session.state.reasoningItems.has(item.id)) emit({ kind: 'thinking-delta', text: item.summary.join('\n'), nativeRef });
+        const reasoning = publicReasoningText(item);
+        if (reasoning && !session.state.reasoningItems.has(item.id)) {
+          session.state.reasoningItems.add(item.id);
+          emit({ kind: 'thinking-delta', text: reasoning, nativeRef });
+        }
       } else if (item?.type === 'fileChange') {
         emitTool(item, session, emit, toolState(item));
         emit({ kind: 'file-change', source: 'native', changes: nativeChanges(item, true), nativeRef });
@@ -509,6 +618,9 @@ function threadOptions(thread) {
   return {
     cwd: thread.cwd,
     ...(thread.options?.model?.id ? { model: thread.options.model.id } : {}),
+    ...(thread.options?.model?.selectionOrigin && thread.options.model.provider
+      ? { modelProvider: thread.options.model.provider }
+      : {}),
     ...(perms.approvalPolicy ? { approvalPolicy: perms.approvalPolicy } : {}),
     ...(approvalsReviewer ? { approvalsReviewer } : {}),
     ...(sandbox ? { sandbox } : {}),
@@ -516,6 +628,18 @@ function threadOptions(thread) {
     ...(thread.options?.permissionMode && thread.options.permissionMode !== 'default' && !perms.permissions
       ? { permissions: permissionModeNativeId(thread.options.permissionMode) }
       : {}),
+  };
+}
+
+function forkOptions(source, lastTurnId) {
+  const configured = source.options?.model?.selectionOrigin ? source.options.model : null;
+  const selected = configured ?? source.model ?? source.options?.model;
+  return {
+    threadId: source.nativeSessionId,
+    ...(lastTurnId ? { lastTurnId } : {}),
+    cwd: source.cwd,
+    ...(selected?.id ? { model: selected.id } : {}),
+    ...(configured?.provider ? { modelProvider: configured.provider } : {}),
   };
 }
 
@@ -534,7 +658,9 @@ function create() {
     },
 
     async open({ thread, emit, diagnostic, collaboration, managedMcp = [] }) {
-      const host = await CodexAppServer.acquire(diagnostic, thread.options?.codexHome);
+      const selectionOrigin = thread.options?.model?.selectionOrigin;
+      const catalog = modelCatalogJson(thread.options?.model);
+      const host = await CodexAppServer.acquire(diagnostic, thread.options?.codexHome, catalog);
       try {
         const servers = require('./managed-mcp').namedServers(managedMcp, collaboration);
         const options = { ...threadOptions(thread), ...(Object.keys(servers).length ? { config: Object.fromEntries(Object.entries(servers).map(([name, value]) => [`mcp_servers.${name}`, value])) } : {}) };
@@ -553,6 +679,9 @@ function create() {
         }
         const model = { id: result.model, name: result.model, provider: result.modelProvider ?? 'openai' };
         const session = attachSession(host, result.thread.id, { emit, diagnostic, model, effort: result.reasoningEffort, cwd: thread.cwd });
+        session.selectionOrigin = selectionOrigin || null;
+        session.codexHome = thread.options?.codexHome;
+        session.modelCatalogJson = catalog;
         if (thread.options?.thinking && thread.options.thinking !== session.state.effort) {
           await host.request('thread/settings/update', { threadId: result.thread.id, effort: thread.options.thinking });
           session.state.effort = thread.options.thinking;
@@ -711,7 +840,7 @@ function create() {
           listAll(host, 'model/list', { includeHidden: false }),
           listAll(host, 'permissionProfile/list').catch(() => []),
         ]);
-        const models = rawModels.map(modelView);
+        const models = withConfiguredProviderModels(rawModels.map(modelView));
         const selected = models.find((model) => model.isDefault) ?? models[0];
         return {
           models,
@@ -729,7 +858,7 @@ function create() {
 
     async describeFor(session) {
       const rawModels = await listAll(session.host, 'model/list', { includeHidden: false });
-      const models = rawModels.map(modelView);
+      const models = withConfiguredProviderModels(rawModels.map(modelView), session.codexHome, session.modelCatalogJson);
       const selected = models.find((model) => model.id === session.model?.id) ?? models.find((model) => model.isDefault) ?? models[0];
       const profiles = await listAll(session.host, 'permissionProfile/list', { cwd: session.cwd }).catch(() => []);
       return {
@@ -746,12 +875,19 @@ function create() {
     },
 
     async listModelsFor(session) {
-      return (await listAll(session.host, 'model/list', { includeHidden: false })).map(modelView);
+      return withConfiguredProviderModels((await listAll(session.host, 'model/list', { includeHidden: false })).map(modelView), session.codexHome, session.modelCatalogJson);
     },
 
     async setModel(session, model) {
+      const targetOrigin = model.selectionOrigin || null;
+      if (targetOrigin !== (session.selectionOrigin || null)) {
+        throw new Error('Codex provider 在 Thread 创建时固定；请选择该模型新建 Codex（协作）任务');
+      }
+      if (targetOrigin && model.provider !== session.model?.provider) {
+        throw new Error('Codex provider 配置已变化；请用当前配置新建 Codex（协作）任务');
+      }
       await session.host.request('thread/settings/update', { threadId: session.nativeSessionId, model: model.id });
-      session.model = { id: model.id, name: model.name ?? model.id, provider: model.provider ?? 'openai' };
+      session.model = { id: model.id, name: model.name ?? model.id, provider: session.model?.provider ?? model.provider ?? 'openai' };
       return session.model;
     },
 
@@ -769,16 +905,17 @@ function create() {
     async fork(source, { emit, diagnostic, message }) {
       const lastTurnId = message?.coreTurn?.nativeTurnRef?.turnId ?? message?.coreTurn?.nativeTurnRef?.checkpointId;
       if (message && !lastTurnId) throw new Error('这条回复缺少 Codex 原生 Turn ID，无法精确分支');
-      const host = await CodexAppServer.acquire(diagnostic, source.options?.codexHome);
+      const selectionOrigin = source.options?.model?.selectionOrigin;
+      const catalog = modelCatalogJson(source.options?.model);
+      const host = await CodexAppServer.acquire(diagnostic, source.options?.codexHome, catalog);
       try {
-        const result = await host.request('thread/fork', {
-          threadId: source.nativeSessionId,
-          ...(lastTurnId ? { lastTurnId } : {}),
-          cwd: source.cwd,
-          ...(source.model?.id ? { model: source.model.id } : {}),
-        });
+        const result = await host.request('thread/fork', forkOptions(source, lastTurnId));
         const model = { id: result.model, name: result.model, provider: result.modelProvider ?? 'openai' };
-        return { session: attachSession(host, result.thread.id, { emit, diagnostic, model, effort: result.reasoningEffort, cwd: source.cwd }) };
+        const session = attachSession(host, result.thread.id, { emit, diagnostic, model, effort: result.reasoningEffort, cwd: source.cwd });
+        session.selectionOrigin = selectionOrigin || null;
+        session.codexHome = source.options?.codexHome;
+        session.modelCatalogJson = catalog;
+        return { session };
       } catch (error) {
         host.release();
         throw error;
@@ -813,4 +950,4 @@ manifest.integrations = { mcp: true, skills: {
   project: ['.agents/skills'],
   overrides: { '.codex/skills': { env: 'CODEX_HOME', suffix: 'skills' } },
 } };
-module.exports = { manifest, create, projectNotification, queueRequest, usageView, modelView, startTurnAfterNativeSettlement, permissionModeTransportId, permissionModeNativeId };
+module.exports = { manifest, create, projectNotification, queueRequest, usageView, modelView, configuredProviderModels, withConfiguredProviderModels, modelCatalogJson, threadOptions, forkOptions, startTurnAfterNativeSettlement, permissionModeTransportId, permissionModeNativeId, publicReasoningText, nativeChildMessages };

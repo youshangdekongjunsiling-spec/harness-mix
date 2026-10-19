@@ -183,6 +183,7 @@
     "test:stuck-turn": "node scripts/stuck-turn-test.cjs",
     "test:pi-cancel-race": "node scripts/pi-cancel-race-test.cjs",
     "test:send-cancel-race": "node scripts/send-cancel-race-test.cjs",
+    "test:claude-cancel-steer": "node scripts/claude-cancel-steer-test.cjs",
     "test:core-review": "node scripts/core-review-test.cjs",
     "test:jsonl-stdin": "node scripts/jsonl-stdin-test.cjs",
     "test:send-pre-turn-cancel": "node scripts/send-pre-turn-cancel-test.cjs",

@@ -218,7 +218,8 @@ class HostRuntime {
       // Desktop 草稿预热线程：投影为 ephemeral，发送首轮消息时转正
       ephemeral: ephemeral === true,
       options: options && typeof options === "object" ? {
-        model: options.model?.id ? { id: String(options.model.id), name: String(options.model.name ?? options.model.id), provider: options.model.provider } : undefined,
+        model: options.model?.id ? { id: String(options.model.id), name: String(options.model.name ?? options.model.id), provider: options.model.provider,
+          selectionOrigin: typeof options.model.selectionOrigin === 'string' ? options.model.selectionOrigin : undefined } : undefined,
         thinking: typeof options.thinking === "string" ? options.thinking : undefined,
         permissionMode: typeof options.permissionMode === "string" ? options.permissionMode : undefined,
         accountId: typeof options.accountId === "string" ? options.accountId : undefined,
@@ -585,6 +586,8 @@ class HostRuntime {
 
   async cancel(threadId, { interrupt = false } = {}) {
     const thread = this.threads.find(t => t.id === threadId);
+    // 捕获取消发起时的 session；后续若恢复出了新 session，旧取消的异步清理只能驱逐旧对象。
+    const session = this.sessions.get(threadId);
     if (interrupt) this.collaboration.interruptOwners.add(threadId);
     // send 进行中（会话恢复 / prompt 尚未投递）时 abort 可能落空：按票据登记取消请求，由 #send 在投递前结算
     if (this.sending.has(threadId)) this.cancelRequests.set(threadId, this.sendTickets.get(threadId));
@@ -601,6 +604,9 @@ class HostRuntime {
     // 立即放锁让用户可以重发；同时作废旧 send 的票据，其 finally 不得误删新发送的锁
     this.sending.delete(threadId);
     this.sendTickets.delete(threadId);
+    // 原生中断与团队清理并发启动。团队成员收尾最多可等 3 秒，不能让旧原生 query
+    // 在这段窗口继续把 assistant/tool/approval 投影到已经取消的 Host Turn。
+    const nativeCancellation = session ? this.#cancelNativeSession(threadId, session) : Promise.resolve();
     // Cancel child collaboration tasks with a hard timeout to prevent child hangs
     try {
       await Promise.race([
@@ -608,8 +614,7 @@ class HostRuntime {
         new Promise(r => setTimeout(r, 3_000)),
       ]);
     } catch {} finally { if (interrupt) this.collaboration.interruptOwners.delete(threadId); }
-    const session = this.sessions.get(threadId);
-    if (session) await Promise.race([session.adapter.cancel(session), new Promise(r => setTimeout(r, 2_000))]).catch(() => {});
+    await nativeCancellation;
     if (thread?.reviewPending) {
       thread.reviewPending = false;
       await this.#save();
@@ -1225,10 +1230,26 @@ class HostRuntime {
       // 常驻后台，下一次发送直接撞上原生侧的会话占用报错（如 Pi 的 already processing），
       // 该 Thread 永久无法恢复。fire-and-forget 不阻塞扫描；迟到事件由 execution.apply 忽略。
       const session = this.sessions.get(thread.id);
-      if (session) void Promise.race([session.adapter.cancel(session), new Promise(r => setTimeout(r, 2000))]).catch(() => {});
+      if (session) void this.#cancelNativeSession(thread.id, session);
       this.#applyEvent({ threadId: thread.id, event: { kind: 'error', timestamp: now,
         message: `原生会话超过 ${Math.round(this.stuckTurnMs / 60000)} 分钟未产生任何事件，判定为卡死并已自动结算。如原生进程仍在运行，可手动取消或开启新回合。` } });
     }
+  }
+
+  /** Adapter 可要求丢弃已经强制关闭的原生 session；迟到的旧取消不得删除后来打开的新 session。 */
+  async #cancelNativeSession(threadId, session) {
+    const cancellation = Promise.resolve()
+      .then(() => session.adapter.cancel(session))
+      .then((result) => {
+        if (result?.discardSession && this.sessions.get(threadId) === session) {
+          this.sessions.delete(threadId);
+          const thread = this.threads.find(item => item.id === threadId);
+          if (thread?.nativeSessionId) thread.restore = true;
+        }
+        return result;
+      })
+      .catch(() => undefined);
+    await Promise.race([cancellation, new Promise(resolve => setTimeout(resolve, 2_000))]);
   }
 
   /** 统一事件投影：Adapter 转换后的标准事件落到线程模型上 */

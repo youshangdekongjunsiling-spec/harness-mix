@@ -56,6 +56,13 @@ function rendererClient(binding = readyBinding()) {
           }
         }
       }
+      if (
+        method === "Runtime.evaluate" &&
+        typeof params?.expression === "string" &&
+        params.expression.includes("__harnessmixSidecarReceiveV1")
+      ) {
+        return { result: { type: "string", value: "delivered" } };
+      }
       if (method === "Runtime.evaluate") return { result: { type: "undefined" } };
       return {};
     }),
@@ -173,6 +180,114 @@ describe("Renderer CDP Control Session", () => {
     expect(client.command).toHaveBeenCalledWith("Runtime.evaluate", {
       expression: expect.stringContaining("(window.__harnessmixPendingSidecarFramesV1 ??= []).push(frame)"),
     });
+    session.close();
+  });
+
+  it("serializes Host-to-renderer frames and continues after a bounded delivery failure", async () => {
+    const client = rendererClient();
+    let output: ((frame: string) => void) | undefined;
+    let releaseFirst: (() => void) | undefined;
+    let rejectFirst: ((error: Error) => void) | undefined;
+    const firstDelivery = new Promise<void>((resolve, reject) => {
+      releaseFirst = resolve;
+      rejectFirst = reject;
+    });
+    const originalCommand = client.command.getMockImplementation();
+    let deliveries = 0;
+    const deliveryExpressions: string[] = [];
+    client.command.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (
+        method === "Runtime.evaluate" &&
+        String(params?.expression).includes("__harnessmixSidecarReceiveV1")
+      ) {
+        deliveries += 1;
+        deliveryExpressions.push(String(params?.expression));
+        if (deliveries === 1) return firstDelivery;
+      }
+      return originalCommand?.(method, params) ?? {};
+    });
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn((listener: (frame: string) => void) => {
+        output = listener;
+        return () => undefined;
+      }),
+      close: vi.fn(),
+    };
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      sidecar,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect: vi.fn(async () => client),
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+
+    output?.('{"id":1,"result":{"status":"ready"}}');
+    output?.('{"id":2,"result":{"status":"ready"}}');
+    expect(deliveries).toBe(1);
+    rejectFirst?.(new Error("transient Runtime.evaluate failure"));
+    await vi.waitFor(() => expect(deliveries).toBe(3));
+    expect(deliveryExpressions[0]).toContain('if (state.seen.has(id)) return "duplicate"');
+    expect(deliveryExpressions[1]).toContain('if (state.seen.has(id)) return "duplicate"');
+    expect(deliveryExpressions[1]).toContain(deliveryExpressions[0]!.match(/id = ("[^"]+")/)![1]);
+    releaseFirst?.();
+    session.close();
+  });
+
+  it("treats Runtime.evaluate exceptionDetails as an inbound delivery failure", async () => {
+    const client = rendererClient();
+    let output: ((frame: string) => void) | undefined;
+    const originalCommand = client.command.getMockImplementation();
+    let deliveries = 0;
+    let rejectDelivery = true;
+    client.command.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (
+        method === "Runtime.evaluate" &&
+        String(params?.expression).includes("__harnessmixSidecarReceiveV1")
+      ) {
+        deliveries += 1;
+        if (rejectDelivery) return { exceptionDetails: { text: "delivery rejected" } };
+      }
+      return originalCommand?.(method, params) ?? {};
+    });
+    const sidecar = {
+      send: vi.fn(),
+      onFrame: vi.fn((listener: (frame: string) => void) => {
+        output = listener;
+        return () => undefined;
+      }),
+      close: vi.fn(),
+    };
+    const session = await createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123",
+      rendererSource: "production renderer",
+      sidecar,
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      operations: {
+        listTargets: vi.fn(async () => [target("page-1")]),
+        connect: vi.fn(async () => client),
+        installDraftPrewarmPolicy: vi.fn(async () => ({
+          state: "ready" as const,
+          reason: "owned-request-bridge" as const,
+        })),
+      },
+    });
+    output?.('{"id":1,"result":{"status":"ready"}}');
+    await vi.waitFor(() => expect(deliveries).toBe(1));
+    rejectDelivery = false;
+    await expect(session.ensureInstalled()).resolves.toMatchObject({ target: { id: "page-1" } });
+    expect(client.commands.filter(({ method }) => method === "Runtime.addBinding")).toHaveLength(2);
+    output?.('{"id":2,"result":{"status":"ready"}}');
+    await vi.waitFor(() => expect(deliveries).toBe(2));
     session.close();
   });
 

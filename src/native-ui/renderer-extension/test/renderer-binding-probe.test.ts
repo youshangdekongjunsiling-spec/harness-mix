@@ -456,6 +456,128 @@ describe("Renderer Composer DOM behavior", () => {
     vi.unstubAllGlobals();
   });
 
+  it("hides a transient native reasoning trigger before React fiber verification is ready", () => {
+    class FakeElement {
+      readonly attributes = new Map<string, string>();
+      className = "";
+      hidden = false;
+      readonly style: Record<string, string> = {};
+
+      click(): void {}
+      contains(): boolean {
+        return false;
+      }
+      getAttribute(name: string): string | null {
+        return this.attributes.get(name) ?? null;
+      }
+      hasAttribute(name: string): boolean {
+        return this.attributes.has(name);
+      }
+      matches(selector: string): boolean {
+        return selector === 'button[aria-haspopup="menu"]';
+      }
+      removeAttribute(name: string): void {
+        this.attributes.delete(name);
+      }
+      setAttribute(name: string, value: string): void {
+        this.attributes.set(name, value);
+      }
+    }
+    vi.stubGlobal("HTMLElement", FakeElement);
+    vi.stubGlobal("document", { activeElement: null });
+    const previous = new FakeElement();
+    previous.hidden = true;
+    previous.setAttribute("aria-hidden", "true");
+    const replacement = new FakeElement();
+    replacement.setAttribute("aria-haspopup", "menu");
+    replacement.setAttribute("data-composer-navigation-target", "reasoning");
+    const composer = {
+      querySelectorAll: (selector: string) =>
+        selector === 'button[aria-haspopup="menu"]' ? [replacement] : [],
+    } as unknown as Element;
+    const rendererTrigger = new FakeElement();
+    const control = {
+      composer,
+      modelPicker: { trigger: rendererTrigger, root: { parentElement: {} } },
+      nativeModelControl: { element: previous, hidden: false, ariaHidden: null },
+      nativePermissionModeControl: null,
+      nativeContextUsageControl: null,
+      credits: { anchor: null, place: vi.fn(), root: { remove: vi.fn() } },
+      usage: { anchor: null, place: vi.fn(), root: { remove: vi.fn() } },
+    } as unknown as ComposerAgentControl;
+
+    reconcileComposerNativeControls(control, true, true);
+
+    expect(previous.hidden).toBe(false);
+    expect(replacement.hidden).toBe(true);
+    expect(replacement.getAttribute("aria-hidden")).toBe("true");
+    expect(rendererTrigger.hidden).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it("hides every native Model trigger during a footer transition and restores official Codex", () => {
+    class FakeElement {
+      readonly attributes = new Map<string, string>();
+      className = "";
+      hidden = false;
+      readonly style: Record<string, string> = {};
+
+      click(): void {}
+      contains(): boolean {
+        return false;
+      }
+      getAttribute(name: string): string | null {
+        return this.attributes.get(name) ?? null;
+      }
+      hasAttribute(name: string): boolean {
+        return this.attributes.has(name);
+      }
+      matches(selector: string): boolean {
+        return selector === 'button[aria-haspopup="menu"]';
+      }
+      removeAttribute(name: string): void {
+        this.attributes.delete(name);
+      }
+      setAttribute(name: string, value: string): void {
+        this.attributes.set(name, value);
+      }
+    }
+    vi.stubGlobal("HTMLElement", FakeElement);
+    vi.stubGlobal("document", { activeElement: null });
+    const candidates = [new FakeElement(), new FakeElement()];
+    for (const candidate of candidates) {
+      candidate.setAttribute("aria-haspopup", "menu");
+      candidate.setAttribute("data-codex-intelligence-trigger", "true");
+      candidate.setAttribute("data-composer-navigation-target", "reasoning");
+    }
+    const composer = {
+      querySelectorAll: (selector: string) =>
+        selector === 'button[aria-haspopup="menu"]' ? candidates : [],
+    } as unknown as Element;
+    const control = {
+      composer,
+      modelPicker: { trigger: new FakeElement(), root: { parentElement: {} } },
+      nativeModelControl: null,
+      nativePermissionModeControl: null,
+      nativeContextUsageControl: null,
+      credits: { anchor: null, place: vi.fn(), root: { remove: vi.fn() } },
+      usage: { anchor: null, place: vi.fn(), root: { remove: vi.fn() } },
+    } as unknown as ComposerAgentControl;
+
+    reconcileComposerNativeControls(control, true, true);
+    expect(candidates.every((candidate) => candidate.hidden)).toBe(true);
+    expect(
+      candidates.every((candidate) => candidate.getAttribute("aria-hidden") === "true"),
+    ).toBe(true);
+
+    reconcileComposerNativeControls(control, false, false);
+    expect(candidates.every((candidate) => !candidate.hidden)).toBe(true);
+    expect(candidates.every((candidate) => candidate.getAttribute("aria-hidden") === null)).toBe(
+      true,
+    );
+    vi.unstubAllGlobals();
+  });
+
   it("resolves an inner contenteditable paragraph to its editor", () => {
     const editor = {} as Element;
     const paragraph = {

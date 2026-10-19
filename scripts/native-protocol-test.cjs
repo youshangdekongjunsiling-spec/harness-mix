@@ -122,7 +122,10 @@ async function main() {
     let openedCodexThread = null;
     const codexAdapter = {
       manifest: { id: 'codex', name: 'Codex', capabilities: { streaming: true, models: true, approvals: true, questions: true, resume: true } },
-      async describe() { return { models: [{ id: 'gpt-test', name: 'GPT Test', provider: 'openai' }], thinkingLevels: [], permissionModes: [] }; },
+      async describe() { return { models: [
+        { id: 'gpt-test', name: 'GPT Test', provider: 'openai' },
+        { id: 'deepseek-flash', name: 'DeepSeek · deepseek-flash', provider: 'deepseek', selectionOrigin: 'deepseek-config' },
+      ], thinkingLevels: [], permissionModes: [] }; },
       async open(input) { openedCodexThread = input.thread; return { nativeSessionId: 'isolated-native-session', model: input.thread.options.model }; },
       async send() {}, async cancel() {}, async close() {},
     };
@@ -159,6 +162,13 @@ async function main() {
       else process.env.CODEX_HOME = previousCodexHome;
     }
     assert.equal(openedCodexThread.options.model.id, 'gpt-test');
+    const deepSeekRef = { id: Buffer.from(JSON.stringify({ id: 'deepseek-flash', provider: 'deepseek' })).toString('base64url') };
+    const deepSeekRoute = `harnessmix/plugin-v1@${Buffer.from(JSON.stringify({ harnessId: 'codex-harness', model: deepSeekRef })).toString('hex')}`;
+    const deepSeekStarted = await bridge.request('thread/start', { cwd: root, model: deepSeekRoute });
+    assert.equal(decodeRoute(deepSeekStarted.thread.model).harnessId, 'codex-harness');
+    assert.deepEqual(openedCodexThread.options.model, {
+      id: 'deepseek-flash', name: 'DeepSeek · deepseek-flash', provider: 'deepseek', selectionOrigin: 'deepseek-config',
+    }, 'Opaque renderer ref resolves to the configured-provider native model before opening');
     const inspection = await bridge.inspect('pi');
     schemas.harnessInspectionSchema.parse(inspection);
     assert.deepEqual(inspection.capabilities.workspace, { git: true, worktree: true, finalDiff: true, nativeDiff: false, nativePatch: false });
@@ -241,7 +251,32 @@ async function main() {
     emit({ kind: 'approval', requestId: 'empty', method: 'input', title: 'Empty?' });
     const emptyQ = events.filter(e => e.method === 'item/tool/requestUserInput').at(-1);
     await bridge.respond({ id: emptyQ.id, result: { answers: { empty: { answers: [] } } } });
-    assert.equal(answers[3].answer.value, '', '空答案数组回退为空字符串而非 undefined');
+    assert.deepEqual(answers[3].answer, { cancelled: true }, '空答案数组按取消处理，不伪造成有效输入');
+    emit({ kind: 'approval', requestId: 'structured', method: 'input', title: 'Claude questions', questions: [
+      { id: 'question_0', header: 'Runtime', question: 'Which runtime?', isOther: true, isSecret: false,
+        options: [{ label: 'Node', description: 'Node.js' }, { label: 'Bun', description: 'Bun' }] },
+      { id: 'question_1', header: 'Features', question: 'Which features?', isOther: true, isSecret: false, multiple: true,
+        options: [{ label: 'Lint', description: 'Linting' }, { label: 'Test', description: 'Tests' }] },
+    ] });
+    const structured = events.filter(e => e.method === 'item/tool/requestUserInput').at(-1);
+    assert.equal(structured.params.questions.length, 2, '结构化提问一次投影全部问题');
+    assert.equal('multiple' in structured.params.questions[1], false, '不向 Desktop 发送未经支持的多选字段');
+    assert.match(structured.params.questions[1].question, /可选择多项.*“其他”/, '多选经受支持的自由文本入口说明');
+    assert.deepEqual(structured.params.questions[1].options, [
+      { label: 'Lint', description: 'Linting' }, { label: 'Test', description: 'Tests' },
+    ], '选项说明完整保留');
+    await bridge.respond({ id: structured.id, result: { answers: {
+      question_0: { answers: ['Node'] }, question_1: { answers: ['Lint', 'Test'] },
+    } } });
+    assert.deepEqual(answers[4], { id: 'structured', answer: { answers: {
+      'Which runtime?': 'Node', 'Which features?': 'Lint, Test',
+    } } }, '结构化单选/多选答案按 Claude SDK 题目文本回传');
+    emit({ kind: 'approval', requestId: 'structured-cancel', method: 'input', title: 'Cancel', questions: [
+      { id: 'question_0', header: 'Runtime', question: 'Which runtime?', options: [{ label: 'Node', description: 'Node.js' }] },
+    ] });
+    const structuredCancel = events.filter(e => e.method === 'item/tool/requestUserInput').at(-1);
+    await bridge.respond({ id: structuredCancel.id, result: { answers: {} } });
+    assert.deepEqual(answers[5], { id: 'structured-cancel', answer: { cancelled: true } }, '缺少答案按取消处理，不转成审批允许');
     emit({ kind: 'approval', requestId: 'replay', method: 'confirm', title: 'Replay?' });
     const replayApprovalId = events.filter(e => e.id?.startsWith('harness-mix:approval:')).at(-1).id;
     const replayCount = events.filter(e => e.id === replayApprovalId).length;
@@ -250,7 +285,7 @@ async function main() {
     assert.equal(events.filter(e => e.id === replayApprovalId).length, replayCount + 1,
       'thread hydration replays a still-live actionable approval request with the stable id');
     await bridge.respond({ id: replayApprovalId, result: { decision: 'decline' } });
-    assert.deepEqual(answers[4], { id: 'replay', answer: { confirmed: false } });
+    assert.deepEqual(answers[6], { id: 'replay', answer: { confirmed: false } });
     await bridge.request('thread/resume', { threadId });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(events.filter(e => e.id === replayApprovalId).length, replayCount + 1,
@@ -266,7 +301,7 @@ async function main() {
       'a persisted interaction without its original live adapter session is never replayed');
     runtime.sessions.set(threadId, liveSession);
     await bridge.respond({ id: disconnectedApprovalId, result: { decision: 'decline' } });
-    assert.deepEqual(answers[5], { id: 'disconnected', answer: { confirmed: false } });
+    assert.deepEqual(answers[7], { id: 'disconnected', answer: { confirmed: false } });
     // 权限模式（回合运行中）：保留用户选择，同时继续回报原生实际生效值，
     // 不向原生会话热应用（CodeBuddy 等会因 turn 进行中拒绝配置）
     const queuedMode = await bridge.request('harnessmix/thread/permission-mode/select', { threadId, permissionModeId: 'bypassPermissions' });

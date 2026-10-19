@@ -781,15 +781,31 @@ function findComposerDraftIds(composer: Element): Set<string> {
     const memoCache = isRecord(updateQueue) ? updateQueue.memoCache : null;
     const data = isRecord(memoCache) && Array.isArray(memoCache.data) ? memoCache.data : [];
     for (const entry of data) {
-      // 26.908 stores the draft-settings hook as a 13-slot memo whose slot 5
-      // holds the route-derived draft id and slot 12 the public result object.
-      if (Array.isArray(entry) && entry.length === 13 &&
-        typeof entry[5] === "string" && entry[5].startsWith("client-new-thread:") &&
-        entry[5] === entry[6] && entry[10] === true && typeof entry[11] === "function" &&
-        isRecord(entry[9]) && "modelSettings" in entry[9] && "isManuallyChanged" in entry[9] &&
-        isRecord(entry[12]) && entry[12].draftSettings === entry[9] &&
-        entry[12].isNewThreadDraft === true && entry[12].updateDraftSettings === entry[11]) {
-        draftIds.add(entry[5]);
+      // 26.908 stores the draft-settings hook as a 13-slot memo. Newer
+      // renderer bundles can insert one dependency before the duplicated
+      // route-derived draft id, shifting the validated settings/result tail.
+      if (Array.isArray(entry) && (entry.length === 13 || entry.length === 14)) {
+        const offset = entry.length === 14 ? 1 : 0;
+        const draftId = entry[5 + offset];
+        const draftSettings = entry[9 + offset];
+        const updateDraftSettings = entry[11 + offset];
+        const result = entry[12 + offset];
+        if (
+          typeof draftId === "string" &&
+          draftId.startsWith("client-new-thread:") &&
+          draftId === entry[6 + offset] &&
+          entry[10 + offset] === true &&
+          typeof updateDraftSettings === "function" &&
+          isRecord(draftSettings) &&
+          "modelSettings" in draftSettings &&
+          "isManuallyChanged" in draftSettings &&
+          isRecord(result) &&
+          result.draftSettings === draftSettings &&
+          result.isNewThreadDraft === true &&
+          result.updateDraftSettings === updateDraftSettings
+        ) {
+          draftIds.add(draftId);
+        }
       }
       // Older builds used the seven-slot draft atom wrapper instead.
       if (

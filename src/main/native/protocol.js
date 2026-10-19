@@ -1231,10 +1231,25 @@ class NativeProtocol {
     const id = `harness-mix:approval:${item.id}`;
     this.approvals.set(id, { threadId, requestId: item.requestId, item });
     const question = item.type === 'question' || item.method === 'select';
+    const questions = Array.isArray(item.questions) && item.questions.length ? item.questions.map(source => ({
+      id: source.id,
+      header: source.header || 'Harness',
+      question: `${source.question || 'Native Harness input'}${source.multiple ? '\n可选择多项；请在“其他”输入中填写多个选项名称。' : ''}`,
+      isOther: source.isOther !== false,
+      isSecret: source.isSecret === true,
+      options: Array.isArray(source.options) ? source.options.map(option => ({
+        label: typeof option === 'string' ? option : option.label || option.id,
+        description: typeof option === 'string' ? option : option.description || option.label || option.id,
+      })) : null,
+    })) : [{
+      id: item.requestId, header: 'Harness', question: item.message || item.title || 'Native Harness input',
+      isOther: true, isSecret: false,
+      options: item.options?.map(o => ({ label: typeof o === 'string' ? o : o.label || o.id,
+        description: typeof o === 'string' ? o : o.description || o.label || o.id })) || null,
+    }];
     this.emit({ id, method: question ? 'item/tool/requestUserInput' : 'item/commandExecution/requestApproval', params: {
       threadId, turnId, itemId: item.id,
-      ...(question ? { questions: [{ id: item.requestId, header: 'Harness', question: item.message || item.title || 'Native Harness input', isOther: true, isSecret: false,
-        options: item.options?.map(o => ({ label: typeof o === 'string' ? o : o.label || o.id, description: typeof o === 'string' ? o : o.description || o.label || o.id })) || null }] }
+      ...(question ? { questions }
         : { reason: item.message || item.title, command: null, cwd: this.thread(threadId)?.cwd, availableDecisions: ['accept', 'decline'] }) } });
   }
   #replayPendingApprovals(thread) {
@@ -1339,10 +1354,25 @@ class NativeProtocol {
     // Desktop 的 answers 为 string[]：多选提问（如 ACP/OpenCode multiple）勾选多项时
     // 只取 [0] 会无声吞掉其余选项，且 opencode 对 multiple 题执行 JSON.parse(response.value)，
     // 单值字符串会直接抛 SyntaxError——多答案 JSON 编码全量保留，单答案维持原字符串。
-    const rawAnswers = message.result?.answers?.[pending.requestId]?.answers;
+    const resultAnswers = message.result?.answers;
+    const rawAnswers = resultAnswers?.[pending.requestId]?.answers;
     const answer = Array.isArray(rawAnswers) && rawAnswers.length > 1 ? JSON.stringify(rawAnswers) : (rawAnswers?.[0] ?? '');
     const decision = message.result?.decision;
-    const response = pending.item.type === 'question' ? { value: answer || '' } : pending.item.method === 'select' ? { value: answer || '' } : { confirmed: decision === 'accept' || decision === 'acceptForSession' };
+    let response;
+    if (pending.item.type === 'question' || pending.item.method === 'select') {
+      if (Array.isArray(pending.item.questions) && pending.item.questions.length) {
+        const answers = {};
+        let cancelled = !resultAnswers || typeof resultAnswers !== 'object';
+        for (const question of pending.item.questions) {
+          const values = resultAnswers?.[question.id]?.answers;
+          if (!Array.isArray(values) || !values.length) { cancelled = true; break; }
+          answers[question.question] = values.join(', ');
+        }
+        response = cancelled ? { cancelled: true } : { answers };
+      } else {
+        response = Array.isArray(rawAnswers) && rawAnswers.length ? { value: answer } : { cancelled: true };
+      }
+    } else response = { confirmed: decision === 'accept' || decision === 'acceptForSession' };
     await this.runtime.respondApproval(pending.threadId, pending.requestId, response);
     this.approvals.delete(message.id);
     return true;
