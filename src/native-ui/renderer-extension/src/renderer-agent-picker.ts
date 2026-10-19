@@ -180,13 +180,17 @@ export function rendererAgentPickerView(
   availability: AgentAvailabilityMap = {},
   codexAccountCount = 0,
 ): RendererAgentPickerView {
-  const handoffMode = state.phase === "locked" && state.agent !== "codex";
+  // Native Codex Threads hand off by importing into the Codex Harness first, so
+  // that Harness cannot be their own target.
+  const handoffMode = state.phase === "locked";
   const optionDisabled = Object.fromEntries(
     agents.map((agent) => [
       agent,
       switching ||
         (state.phase === "locked" &&
-          (!handoffMode || agent === "codex" || agent === state.agent)) ||
+          (agent === "codex" ||
+            agent === state.agent ||
+            (state.agent === "codex" && agent === "codex-harness"))) ||
         (agent !== "codex" && (adapterState !== "ready" || availability[agent] !== "ready")),
     ]),
   ) as Partial<Record<RendererAgent, boolean>>;
@@ -883,7 +887,7 @@ export function renderRendererAgentPicker(
     control.iconSlot.dataset.agent = state.agent;
   }
   const copy = pickerCopy();
-  const handoffMode = state.phase === "locked" && state.agent !== "codex";
+  const handoffMode = state.phase === "locked";
   control.trigger.disabled = view.triggerDisabled || ownershipError;
   control.trigger.setAttribute("aria-busy", String(switching));
   control.trigger.setAttribute(

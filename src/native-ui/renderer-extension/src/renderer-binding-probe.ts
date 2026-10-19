@@ -1607,12 +1607,68 @@ export function installRendererBindingProbe(
     }
   };
 
+  // A native Codex Thread lives in the official app-server, not the Harness Mix
+  // runtime: import it as a Codex Harness Thread, hand that Thread off, then
+  // open it. The native Thread itself is left untouched.
+  const performNativeCodexHandoff = async (
+    mounted: ComposerEntry,
+    nativeThreadId: string,
+    request: RendererHarnessHandoffRequest,
+  ): Promise<void> => {
+    const client = mounted.hostId === "local" ? modelClientForHost("local") : null;
+    if (!client?.importHarnessSession || !client.switchHarness) {
+      mounted.control.harnessHandoff.showError(
+        settingsLifecycle.locale === "zh-CN" ? "当前任务无法使用 Harness 接力。" : "Harness handoff is unavailable for this task.",
+      );
+      return;
+    }
+    mounted.harnessSwitching = true;
+    mounted.control.harnessHandoff.setSubmitting(true);
+    paintComposer(mounted);
+    try {
+      const { threadId } = await client.importHarnessSession({
+        harnessId: externalHarnessIds["codex-harness"],
+        nativeSessionId: nativeThreadId,
+      });
+      await client.switchHarness({
+        threadId,
+        harnessId: externalHarnessIds[request.to],
+        ...(request.note ? { note: request.note } : {}),
+        intent: request.intent,
+        includes: request.includes,
+      });
+      if (composerEntries.get(mounted.composer) === mounted) mounted.control.harnessHandoff.close();
+      await openRendererThread(threadId, { hostId: "local" });
+    } catch (error) {
+      if (composerEntries.get(mounted.composer) === mounted) {
+        mounted.control.harnessHandoff.showError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (composerEntries.get(mounted.composer) === mounted) {
+        mounted.harnessSwitching = false;
+        mounted.control.harnessHandoff.setSubmitting(false);
+        paintComposer(mounted);
+      }
+    }
+  };
+
   const performHarnessHandoff = async (
     mounted: ComposerEntry,
     request: RendererHarnessHandoffRequest,
   ): Promise<void> => {
     const threadId = threadIdFromComposerModelTarget(mounted.modelTarget);
     const current = controller.get(mounted.composer);
+    if (
+      threadId &&
+      current.phase === "locked" &&
+      current.agent === "codex" &&
+      request.from === "codex-harness" &&
+      request.to !== "codex-harness" &&
+      !mounted.harnessSwitching
+    ) {
+      await performNativeCodexHandoff(mounted, threadId, request);
+      return;
+    }
     if (
       !threadId ||
       current.phase !== "locked" ||
@@ -2947,8 +3003,10 @@ export function installRendererBindingProbe(
         if (!composer.isConnected || !mounted) return;
         const current = controller.get(composer);
         if (current.phase === "locked") {
-          if (current.agent !== "codex" && agent !== "codex") {
-            mounted.control.harnessHandoff.open(current.agent, agent, settingsLifecycle.locale);
+          if (agent !== "codex") {
+            // A native Codex Thread is handed off as its imported Codex Harness Thread.
+            const from = current.agent === "codex" ? "codex-harness" : current.agent;
+            if (from !== agent) mounted.control.harnessHandoff.open(from, agent, settingsLifecycle.locale);
           }
           return;
         }
