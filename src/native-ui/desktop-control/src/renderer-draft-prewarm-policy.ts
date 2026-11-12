@@ -26,6 +26,34 @@ export interface RendererRequestManagerCandidate<Manager = object, RequestClient
   prewarmedThreadManager: unknown;
 }
 
+interface ComposerEditorCandidate {
+  hidden?: boolean;
+  getAttribute?(name: string): string | null;
+  getClientRects?(): { length: number };
+}
+
+interface ComposerEditorStyle {
+  display?: string;
+  visibility?: string;
+}
+
+/** Selects the active Desktop composer without routing through a cached,
+ * hidden editor. Multiple visible editors are deliberately ambiguous. */
+export function selectUniqueVisibleComposerEditor<Editor extends ComposerEditorCandidate>(
+  editors: readonly Editor[],
+  getStyle: (editor: Editor) => ComposerEditorStyle | null | undefined,
+): Editor | null {
+  const visible = editors.filter((editor) => {
+    if (editor.hidden === true || editor.getAttribute?.("aria-hidden") === "true") return false;
+    if (typeof editor.getClientRects !== "function" || editor.getClientRects().length === 0) {
+      return false;
+    }
+    const style = getStyle(editor);
+    return style?.display !== "none" && style?.visibility !== "hidden";
+  });
+  return visible.length === 1 ? (visible[0] ?? null) : null;
+}
+
 export function selectRendererRequestManager<Manager, RequestClient>(
   candidates: readonly RendererRequestManagerCandidate<Manager, RequestClient>[],
   activeHostIds: readonly unknown[],
@@ -89,7 +117,10 @@ const FIND_REQUEST_MANAGER_EXPRESSION = `(() => {
   const editors = [...document.querySelectorAll(
     '[data-codex-composer], [contenteditable="true"][role="textbox"]',
   )];
-  let element = editors.length === 1 ? editors[0] : null;
+  let element = (${selectUniqueVisibleComposerEditor.toString()})(
+    editors,
+    (editor) => window.getComputedStyle(editor),
+  );
   let fiber = null;
   while (element != null && fiber == null) {
     const key = Object.getOwnPropertyNames(element).find((name) =>
@@ -156,6 +187,13 @@ const REQUEST_MANAGER_POLL_INTERVAL_MS = 25;
 
 function directRendererInstaller(): string {
   return `(async () => {
+    if (
+      window.__harnessmixNativeManagerBindingV1?.state === 'ready' &&
+      window.__harnessmixDraftPrewarmPolicyV1?.state === 'ready' &&
+      typeof window.__harnessmixDraftPrewarmPolicyV1?.requestTarget === 'function'
+    ) {
+      return { state: 'ready', reason: 'owned-request-bridge' };
+    }
     const selected = ${FIND_REQUEST_MANAGER_EXPRESSION};
     if (
       selected.candidateCount !== 1 ||

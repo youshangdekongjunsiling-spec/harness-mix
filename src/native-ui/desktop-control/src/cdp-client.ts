@@ -242,8 +242,8 @@ export class CdpClient {
     return new CdpClient(socket, options.commandTimeoutMs ?? 10_000);
   }
 
-  command(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    return this.#request(method, params);
+  command(method: string, params: Record<string, unknown> = {}, options?: { timeoutMs?: number }): Promise<unknown> {
+    return this.#request(method, params, undefined, options?.timeoutMs);
   }
 
   sessionCommand(
@@ -271,6 +271,7 @@ export class CdpClient {
       expression,
       awaitPromise: true,
       returnByValue: true,
+      allowUnsafeEvalBlockedByCSP: true,
     });
     if (!isRecord(response)) throw new Error("Runtime.evaluate returned an invalid result");
     if (isRecord(response.exceptionDetails)) {
@@ -303,6 +304,7 @@ export class CdpClient {
     method: string,
     params: Record<string, unknown>,
     sessionId?: string,
+    timeoutMs?: number,
   ): Promise<unknown> {
     if (this.#closed) return Promise.reject(new Error("CDP client is closed"));
     const id = ++this.#ids;
@@ -312,7 +314,7 @@ export class CdpClient {
         this.#awaiting.delete(id);
         settled = true;
         reject(new Error(`CDP command '${method}' timed out`));
-      }, this.#commandTimeoutMs);
+      }, timeoutMs ?? this.#commandTimeoutMs);
       this.#awaiting.set(id, {
         timer,
         settle(pending: unknown) {

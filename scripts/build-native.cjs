@@ -41,6 +41,11 @@ async function main() {
     banner: { js: `globalThis.__HARNESS_MIX_ICONS__=${JSON.stringify(icons)};globalThis.__HARNESS_MIX_MODEL_FAMILIES__=${JSON.stringify(MODEL_FAMILIES.map(f => ({ id: f.id, pattern: f.regex.source })))};` } });
   await esbuild.build({ ...common, entryPoints: ['src/native-ui/desktop-control/src/release-main.ts'],
     platform: 'node', format: 'esm', outfile: path.join(out, 'desktop-controller.mjs') });
+  if (process.argv.includes('--ui-only')) {
+    fs.writeFileSync(path.join(out, 'node-path.txt'), process.execPath);
+    console.log('Harness Mix Renderer and Desktop Controller built; native binaries unchanged.');
+    return;
+  }
   execFileSync(cargoCommand(), ['build', '--release', '--manifest-path', path.join(root, 'src/main/native/rs/Cargo.toml'),
     ...(process.platform === 'win32' ? [] : ['--package', 'harness-mix-shim'])], { stdio: 'inherit', windowsHide: true });
   const target = path.join(root, 'src/main/native/rs/target/release');

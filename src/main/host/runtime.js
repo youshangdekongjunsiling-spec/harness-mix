@@ -473,6 +473,10 @@ class HostRuntime {
       }
       this.#notifyConcurrentCwd(thread);
     }
+    // A persistent native session can wake itself while this send is preparing
+    // (for example a background task settles during ensureOpen). Do not create a
+    // second Core turn or append a user message over that native turn.
+    if (this.execution.isRunning(thread.id)) throw new Error('Claude 原生后台任务已自动接续，请等待当前回合完成');
     this.verificationGates.invalidate(thread);
     thread.messages.push({ id: randomUUID(), role: "user", text: text ?? '', at: Date.now(), ...(prepared.meta.length ? { attachments: prepared.meta } : {}), ...(hasConcurrentTurn ? { concurrent: true } : {}) });
     thread.updatedAt = Date.now();
@@ -1257,6 +1261,22 @@ class HostRuntime {
     if (!event) return;
     const thread = this.threads.find((t) => t.id === threadId);
     if (!thread) return;
+    if (event.kind === 'native-turn-start') {
+      // Claude's persistent SDK query can wake itself for a completed background
+      // task or session cron. Represent that native model turn in Core before its
+      // first output frame, without adding a user message or sending any prompt.
+      if (this.execution.isRunning(thread.id)) return;
+      const timestamp = event.timestamp ?? Date.now();
+      const turn = this.execution.turnStarted(thread, '', timestamp, { projectUser: false });
+      thread.updatedAt = timestamp;
+      this.turnActivity.set(thread.id, timestamp);
+      this.verificationGates.invalidate(thread);
+      this.observer?.turnStarted(thread, this.core);
+      this.#syncCore(thread);
+      void this.#save();
+      this.#broadcast();
+      return turn;
+    }
     if (event.kind === 'native-subagent') {
       const key = `${thread.id}:${event.nativeSessionId}`;
       const previous = this.nativeSubagentSync.get(key) ?? Promise.resolve();

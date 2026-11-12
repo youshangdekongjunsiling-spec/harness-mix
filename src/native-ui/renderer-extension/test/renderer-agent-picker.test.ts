@@ -147,7 +147,7 @@ describe("Renderer Agent picker presentation", () => {
     });
   });
 
-  it("keeps an official Codex conversation locked because HostRuntime does not own it", () => {
+  it("offers the explicit external handoff while leaving the official model visible", () => {
     expect(
       rendererAgentPickerView(
         { agent: "codex", phase: "locked" },
@@ -156,7 +156,7 @@ describe("Renderer Agent picker presentation", () => {
         ["codex", "pi"],
         { pi: "ready" },
       ),
-    ).toMatchObject({ triggerDisabled: true, optionDisabled: { codex: true, pi: true } });
+    ).toMatchObject({ triggerDisabled: false, nativeModelHidden: false, optionDisabled: { codex: true, pi: false } });
   });
 
   it("hides the native Model and disables all choices while switching", () => {

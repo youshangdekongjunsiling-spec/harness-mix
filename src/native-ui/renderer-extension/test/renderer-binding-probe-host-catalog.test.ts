@@ -93,6 +93,10 @@ vi.mock("../src/renderer-harness-mentions.js", () => ({
   installHarnessMentions: () => ({ prepareSubmission: testState.prepareMentions, dispose: vi.fn() }),
 }));
 
+vi.mock("../src/attention-workbench.js", () => ({
+  installAttentionWorkbench: () => ({ open: vi.fn(), close: vi.fn(), refresh: vi.fn(), dispose: vi.fn() }),
+}));
+
 vi.mock("../src/renderer-team-cards.js", () => ({
   installTeamCards: () => ({ dispose: vi.fn() }),
 }));

@@ -4,6 +4,7 @@ import {
   installRendererDraftPrewarmPolicy,
   installRendererDraftPrewarmPolicyDirect,
   selectRendererRequestManager,
+  selectUniqueVisibleComposerEditor,
   rendererRequestManagerFromHook,
 } from "../src/renderer-draft-prewarm-policy.js";
 import {
@@ -873,6 +874,53 @@ function rendererFixture(
 }
 
 describe("Renderer draft prewarm policy", () => {
+  function editorFixture(options: {
+    rectCount?: number;
+    hidden?: boolean;
+    ariaHidden?: boolean;
+    display?: string;
+    visibility?: string;
+  } = {}) {
+    return {
+      hidden: options.hidden ?? false,
+      getAttribute: (name: string) =>
+        name === "aria-hidden" && options.ariaHidden === true ? "true" : null,
+      getClientRects: () => ({ length: options.rectCount ?? 1 }),
+      style: {
+        display: options.display ?? "block",
+        visibility: options.visibility ?? "visible",
+      },
+    };
+  }
+
+  it("selects the sole visible editor among cached hidden composers", () => {
+    const cachedByLayout = editorFixture({ rectCount: 0 });
+    const cachedByAttribute = editorFixture({ ariaHidden: true });
+    const cachedByStyle = editorFixture({ display: "none" });
+    const active = editorFixture();
+
+    expect(
+      selectUniqueVisibleComposerEditor(
+        [cachedByLayout, cachedByAttribute, active, cachedByStyle],
+        (editor) => editor.style,
+      ),
+    ).toBe(active);
+  });
+
+  it("fails closed when no visible composer editor exists", () => {
+    const cached = editorFixture({ rectCount: 0 });
+    expect(selectUniqueVisibleComposerEditor([cached], (editor) => editor.style)).toBeNull();
+    expect(selectUniqueVisibleComposerEditor([], (editor) => editor.style)).toBeNull();
+  });
+
+  it("fails closed when multiple composer editors are visible", () => {
+    const first = editorFixture();
+    const second = editorFixture();
+    expect(
+      selectUniqueVisibleComposerEditor([first, second], (editor) => editor.style),
+    ).toBeNull();
+  });
+
   it("selects the request manager owned by the active remote Composer Host", () => {
     const localManager = {};
     const remoteManager = {};
@@ -1853,6 +1901,8 @@ describe("Renderer draft prewarm policy", () => {
     });
     const expression = evaluate.mock.calls[0]?.[0];
     expect(expression).toContain("document.querySelectorAll");
+    expect(expression).toContain("selectUniqueVisibleComposerEditor");
+    expect(expression).toContain("getClientRects");
     expect(expression).toContain("installDraftPrewarmPolicyBridge");
     expect(expression).not.toContain("webContents.fromId");
   });

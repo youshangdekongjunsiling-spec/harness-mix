@@ -9,6 +9,30 @@ function stateFile(env = process.env) {
   return path.join(env.CODEX_HOME || path.join(os.homedir(), '.codex'), '.codex-global-state.json');
 }
 
+function readCodexProjectState(env = process.env) {
+  try {
+    const value = JSON.parse(fs.readFileSync(stateFile(env), 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function listCodexProjects(state = readCodexProjectState()) {
+  const projects = [];
+  for (const [id, project] of Object.entries(state?.['local-projects'] || {})) {
+    if (!id || !project || typeof project !== 'object' || Array.isArray(project)) continue;
+    const rootPaths = [...new Set((project.rootPaths || [])
+      .filter(root => typeof root === 'string' && path.isAbsolute(root))
+      .map(root => path.normalize(root)))];
+    const explicitName = [project.name, project.title, project.displayName]
+      .find(value => typeof value === 'string' && value.trim());
+    const fallback = rootPaths[0] ? path.basename(rootPaths[0]) : id;
+    projects.push({ id, name: explicitName?.trim() || fallback || id, rootPaths });
+  }
+  return projects;
+}
+
 function normalizeDirectory(value) {
   if (typeof value !== 'string' || !value) return null;
   const normalized = path.normalize(value).replace(/[\\/]+$/, '');
@@ -78,4 +102,10 @@ function projectIdsForThread(thread) {
   return [...ids];
 }
 
-module.exports = { projectIdForThread, projectIdsForThread, resolveThreadProjectId };
+module.exports = {
+  listCodexProjects,
+  projectIdForThread,
+  projectIdsForThread,
+  readCodexProjectState,
+  resolveThreadProjectId,
+};

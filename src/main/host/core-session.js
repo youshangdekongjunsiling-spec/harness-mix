@@ -27,12 +27,12 @@ class CoreSession {
     if (!this.normalizers.has(thread.id)) this.normalizers.set(thread.id, new EventNormalizer({ threadId: thread.id, source: thread.harnessId }));
     return this.normalizers.get(thread.id);
   }
-  turnStarted(thread, text, timestamp = Date.now()) {
+  turnStarted(thread, text, timestamp = Date.now(), { projectUser = true } = {}) {
     const turn = this.core.turns.create({ threadId: thread.id, nativeTurnRef: { sessionId: thread.nativeSessionId } }, timestamp);
     this.lastTurns.set(thread.id, turn.id);
     const normalizer = this.normalizer(thread);
     this.core.dispatch({ threadId: thread.id, turnId: turn.id, type: 'turn.started', timestamp });
-    for (const event of normalizer.beginTurn(turn.id, text, thread.messages.at(-1)?.attachments)) this.core.dispatch({ ...event, timestamp });
+    for (const event of normalizer.beginTurn(turn.id, text, thread.messages.at(-1)?.attachments, { projectUser })) this.core.dispatch({ ...event, timestamp });
     thread.messages.push({ id: turn.id, role: 'assistant', coreTurnId: turn.id });
     this.sync(thread);
     return turn;

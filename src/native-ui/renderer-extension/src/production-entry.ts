@@ -5,6 +5,8 @@
  */
 import { DEFAULT_RENDERER_AGENTS, type RendererAgent } from "./agent-selection-state.js";
 import { installRendererBinding } from "./install-renderer-binding.js";
+import { installRateLimitComposerUnlock } from "./renderer-rate-limit-unlock.js";
+import { installNativeRendererManager } from './install-native-renderer-manager.js';
 
 declare global {
   interface Window {
@@ -17,18 +19,23 @@ declare global {
 const configuration = window.__harnessmixProductionConfigV1;
 delete window.__harnessmixProductionConfigV1;
 
-const install = (): void => {
-  installRendererBinding(DEFAULT_RENDERER_AGENTS, configuration?.defaultAgent ?? "codex");
+const install = async (): Promise<void> => {
+  installRateLimitComposerUnlock();
+  const publishBinding = () => {
+    installRendererBinding(DEFAULT_RENDERER_AGENTS, configuration?.defaultAgent ?? "codex");
+  };
+  const nativeBinding = await installNativeRendererManager(publishBinding);
+  if (!nativeBinding) publishBinding();
 };
 
 // In sidecar mode the renderer must wait for the draft prewarm policy bridge
 // (installed separately) before binding — it provides the transport.
 const installWhenTransportReady = (): void => {
-  if (window.__harnessmixSidecarModeV1 === true && !window.__harnessmixDraftPrewarmPolicyV1) {
-    window.addEventListener("harnessmix:draft-prewarm-policy-changed", install, { once: true });
-    return;
-  }
-  install();
+  void install().catch((error) => {
+    console.error('harnessmix native Renderer manager installation failed', error);
+    // No substitute UI is installed. Official Codex remains on the untouched
+    // stock RPC while the external route stays explicitly unsupported.
+  });
 };
 
 if (document.documentElement && document.body) {

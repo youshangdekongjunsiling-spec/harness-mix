@@ -95,6 +95,16 @@ async function main() {
     runtime.catalogs.set('claude', { models: [{ id: 'opus', name: 'Native resolved model' }] });
     assert.deepEqual(bridge.configuration({ harnessId: 'claude', model: { id: 'resolved-model[1M]' }, options: { model: { id: 'opus' } } }).effectiveModel, ref({ id: 'opus' }), 'Keep the native selectable alias after runtime initialization');
     runtime.catalogs.delete('pi');
+    runtime.catalogs.set('claude', { models: [{ id: 'fable', resolved: 'claude-fable-5-1', efforts: ['high'] }] });
+    const resolvedClaude = { harnessId: 'claude', model: { id: 'claude-fable-5-1' } };
+    assert.deepEqual(bridge.configuration(resolvedClaude).effectiveModel, ref({ id: 'fable' }), 'Resolve a native runtime model to its unique selectable alias');
+    assert.deepEqual(bridge.configuration(resolvedClaude).availableThinkingOptions, [{ id: 'high', label: 'high' }]);
+    runtime.catalogs.set('claude', { models: [{ id: 'fable', resolved: 'claude-fable-5-1' }, { id: 'default', resolved: 'claude-fable-5-1' }] });
+    assert.deepEqual(bridge.configuration(resolvedClaude).effectiveModel, ref(resolvedClaude.model), 'Do not guess between aliases resolving to the same runtime model');
+    assert.deepEqual(bridge.configuration({ ...resolvedClaude, options: { model: { id: 'fable' } } }).effectiveModel, ref({ id: 'fable' }), 'Explicit selection wins over ambiguous resolved aliases');
+    runtime.catalogs.set('claude', { models: [{ id: 'fable', provider: 'a', resolved: 'claude-fable-5-1' }] });
+    const otherProvider = { id: 'claude-fable-5-1', provider: 'b' };
+    assert.deepEqual(bridge.configuration({ ...resolvedClaude, model: otherProvider }).effectiveModel, ref(otherProvider), 'Resolved aliases never cross a provider boundary');
     const esbuild = require('esbuild');
     const schemaPath = path.join(root, 'schemas.cjs');
     await esbuild.build({ entryPoints: ['src/native-ui/shared-contracts/src/index.ts'], outfile: schemaPath, bundle: true, platform: 'node', format: 'cjs', logLevel: 'silent' });

@@ -21,7 +21,7 @@ class EventNormalizer {
   }
 
   /** Turn 开始：先产出 user_message（已完成），后续 delta 归入本 Turn */
-  beginTurn(turnId, userText, attachments = []) {
+  beginTurn(turnId, userText, attachments = [], { projectUser = true } = {}) {
     this.turnId = turnId;
     this.currentNativeRef = undefined;
     this.turnActive = true;
@@ -32,10 +32,10 @@ class EventNormalizer {
     this.activeSlot = null;
     this.segmentSequence = 0;
     const itemId = `item_user_${turnId}`;
-    return [
+    return projectUser ? [
       this.#event({ type: 'item.started', itemId, payload: { type: 'user_message', content: userText, ...(attachments.length ? { attachments } : {}) } }),
       this.#event({ type: 'item.completed', itemId }),
-    ];
+    ] : [];
   }
 
   /**

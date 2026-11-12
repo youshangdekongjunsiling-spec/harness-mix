@@ -90,6 +90,7 @@ import {
   type UpdateStartResult,
   type UpdateStatusResult,
 } from "@harnessmix/shared-contracts";
+import { createAttentionClient, type AttentionClient } from "./attention-client.js";
 
 import {
   createRendererRequestSender,
@@ -203,6 +204,7 @@ function resolveNotificationTarget(
 }
 
 export interface RendererModelClient extends Partial<RendererSessionImportClient>, Partial<RendererIntegrationsClient> {
+  attentionClient?: AttentionClient;
   petsClient?: RendererPetsClient;
   inspectStorage?(): Promise<import('./settings/storage-page.js').RendererStorageInspection>;
   optimizeStorage?(): Promise<{ before: import('./settings/storage-page.js').RendererStorageInspection; after: import('./settings/storage-page.js').RendererStorageInspection }>;
@@ -326,6 +328,7 @@ export function createRendererModelClient(
   );
   const source = managers[0];
   if (managers.length !== 1 || !source) return null;
+  const notifications = resolveNotificationTarget(source);
   const manager = {
     sendRequest: createRendererRequestSender(
       (method, params) => source.sendRequest(method, params),
@@ -389,6 +392,12 @@ export function createRendererModelClient(
   };
 
   return Object.freeze({
+    attentionClient: createAttentionClient(
+      (method, params) => manager.sendRequest(method, params),
+      notifications?.addNotificationCallback
+        ? (methods, listener) => notifications.addNotificationCallback!(methods, listener)
+        : undefined,
+    ),
     async inspectStorage() { return await manager.sendRequest('harnessmix/storage/inspect', {}) as import('./settings/storage-page.js').RendererStorageInspection; },
     async optimizeStorage() { return await manager.sendRequest('harnessmix/storage/optimize', {}) as { before: import('./settings/storage-page.js').RendererStorageInspection; after: import('./settings/storage-page.js').RendererStorageInspection }; },
     async listCollaborationAgents(): Promise<Array<{ id: string; name: string; available: boolean; lead: boolean; teamReady?: boolean }>> {

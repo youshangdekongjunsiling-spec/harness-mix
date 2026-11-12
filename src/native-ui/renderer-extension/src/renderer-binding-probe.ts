@@ -89,6 +89,8 @@ import {
 } from "./renderer-harness-command-claim.js";
 import { installRendererSettingsLifecycle } from "./harness-mix-settings.js";
 import { openRendererThread } from "./renderer-fork-control.js";
+import { openAttentionThread } from './attention-navigation.js';
+import { installAttentionWorkbench } from "./attention-workbench.js";
 import type {
   RendererConnectionDiagnostics,
   RendererConnectionSnapshot,
@@ -949,6 +951,10 @@ export function installRendererBindingProbe(
     onLocaleChange() {
       for (const mounted of composerEntries.values()) paintComposer(mounted);
     },
+  });
+  const attentionWorkbench = installAttentionWorkbench({
+    getClient: () => modelClientForHost('local')?.attentionClient ?? null,
+    openThread: openAttentionThread,
   });
   let adapterStatus: RendererAdapterStatus = {
     state: "installing",
@@ -3729,6 +3735,7 @@ export function installRendererBindingProbe(
       collaborationCards.dispose();
       teamCards.dispose();
       settingsLifecycle.dispose();
+      attentionWorkbench.dispose();
       document.removeEventListener("beforeinput", handleBeforeInput, true);
       document.removeEventListener("submit", handleSubmit, true);
       document.removeEventListener("keydown", handleKeyDown, true);

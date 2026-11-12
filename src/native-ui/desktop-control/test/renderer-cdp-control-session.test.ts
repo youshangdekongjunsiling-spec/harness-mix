@@ -136,7 +136,20 @@ describe("Renderer CDP Control Session", () => {
       },
     ]);
     expect(session.snapshot.binding).toEqual(readyBinding());
+    expect(client.command).toHaveBeenCalledWith("Runtime.evaluate", { expression: source, awaitPromise: true }, { timeoutMs: 60_000 });
     session.close();
+  });
+
+  it("does not treat an independent panel status as native routing compatibility", async () => {
+    const binding = readyBinding(); binding.adapter.reason = "independent-sidecar-panel";
+    const client = rendererClient(binding);
+    const policy = vi.fn(async () => { throw new Error("native manager is unavailable"); });
+    await expect(createRendererCdpControlSession({
+      rendererCdpEndpoint: "http://127.0.0.1:43123", rendererSource: "production renderer",
+      pollIntervalMs: 1, timeoutMs: 100,
+      operations: { listTargets: async () => [target("page-1")], connect: async () => client, installDraftPrewarmPolicy: policy },
+    })).rejects.toThrow("native manager is unavailable");
+    expect(policy).toHaveBeenCalledTimes(1);
   });
 
   it("carries explicitly routed Host frames over a separate CDP binding", async () => {

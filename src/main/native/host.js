@@ -34,7 +34,12 @@ async function runNativeHost() {
     } catch { /* best-effort */ }
   };
   const traffic = (kind, message) => {
-    try { fs.appendFileSync(trafficLog, JSON.stringify({ ts: Date.now(), pid: process.pid, kind, message: redact(slim(message)) }) + '\n'); } catch {}
+    // Question answers may include isSecret fields. The independent reply
+    // endpoint needs delivery diagnostics, never a second copy of the answer.
+    const diagnostic = message?.method === 'harnessmix/interaction/respond'
+      ? { id: message.id, method: message.method, params: { requestId: message.params?.requestId, resultOmitted: true } }
+      : message;
+    try { fs.appendFileSync(trafficLog, JSON.stringify({ ts: Date.now(), pid: process.pid, kind, message: redact(slim(diagnostic)) }) + '\n'); } catch {}
   };
   // Apply a verified one-time snapshot repair before this process loads the store.
   try {

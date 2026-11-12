@@ -74,7 +74,12 @@ function projectEvent(event) {
     const usage = usageFromResult(event);
     if (usage) out.push({ kind: "usage", usage });
     if (event.is_error || event.subtype !== "success") out.push({ kind: "error", message: event.result || `Claude 执行失败（${event.subtype ?? "error"}）` });
-    out.push({ kind: "completed", finalAnswer: !event.is_error && event.subtype === "success" });
+    // SDK terminal_reason has a broad internal enum. For Host projection every
+    // successful ordinary turn is completed; only background_requested carries
+    // distinct UI/lifecycle meaning (the query remains parked for a later wake).
+    const stopReason = event.terminal_reason === 'background_requested'
+      ? 'background_requested' : event.is_error ? (event.terminal_reason ?? 'error') : 'completed';
+    out.push({ kind: "completed", finalAnswer: !event.is_error && event.subtype === "success", stopReason });
   }
   return out.map(mapped => ({ ...mapped, nativeRef: {
     sessionId: event.session_id, itemId: event.message?.id,
@@ -283,6 +288,18 @@ class MessageQueue {
   }
 }
 
+// Harness's Fable selection follows the newest version actually advertised
+// by Claude, even while the upstream "fable" alias lags behind that version.
+function latestFableModel(models) {
+  const candidates = models.flatMap(model => {
+    const id = model.resolvedModel || model.resolved || model.value || model.id;
+    const match = /^claude-fable-(\d+)(?:-(\d+))?$/.exec(id || '');
+    return match ? [{ id, major: Number(match[1]), minor: Number(match[2] || 0) }] : [];
+  });
+  candidates.sort((a, b) => b.major - a.major || b.minor - a.minor);
+  return candidates[0] || null;
+}
+
 async function loadSdk() {
   return import("@anthropic-ai/claude-agent-sdk");
 }
@@ -355,8 +372,9 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
     pendingApprovals: new Map(),
     // 注意：runtime 以浅拷贝保存 adapter session（{ adapter, ...session }），
     // 泵写入的可变状态必须放在共享引用的 state 容器内，拷贝内外才一致。
-    state: { turn: null, crashed: false, closed: false, lastUsage: undefined, latestPlanLimit: undefined, checkpointId: undefined,
-      nativeChildren: new Map() },
+    state: { turn: null, nativeTurnActive: false, pendingWakeSource: undefined,
+      backgroundTasks: new Map(), crashed: false, closed: false, lastUsage: undefined,
+      latestPlanLimit: undefined, checkpointId: undefined, nativeChildren: new Map() },
   };
 
   // Host 侧投影异常绝不能杀死原生事件泵：crashed 只保留给真正的原生流错误。
@@ -365,6 +383,19 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
   const safeEmit = (mapped) => {
     if (session.state.closed) return;
     try { emit(mapped); } catch { /* host projection must not kill the native pump */ }
+  };
+
+  // A streaming-input query stays alive after each result. Background task
+  // delivery and session cron can later start a model turn without host input.
+  // Announce that native turn before its first frame so Host can project it
+  // without sending a synthetic prompt back to Claude.
+  const beginNativeWakeTurn = (source) => {
+    if (session.state.closed || session.state.nativeTurnActive) return false;
+    session.state.nativeTurnActive = true;
+    const wakeSource = source || session.state.pendingWakeSource || 'system';
+    session.state.pendingWakeSource = undefined;
+    safeEmit({ kind: 'native-turn-start', source: wakeSource });
+    return true;
   };
 
   const syncNativeChildren = async () => {
@@ -401,6 +432,15 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
       ...(modelId ? { model: modelId } : {}),
       ...(claudeExecutable.executable ? { pathToClaudeCodeExecutable: claudeExecutable.executable } : {}),
       hooks: {
+        UserPromptSubmit: [{ hooks: [async (hookInput) => {
+          // user/sdk are ordinary composer/streamInput submissions. The other
+          // documented sources are CLI-owned wakeups.
+          if (['system', 'loop_wakeup', 'schedule_wakeup', 'poll_event'].includes(hookInput.source)) {
+            session.state.pendingWakeSource = hookInput.source;
+            beginNativeWakeTurn(hookInput.source);
+          }
+          return {};
+        }] }],
         SubagentStart: [{ hooks: [async (input) => {
           if (input.agent_id && input.session_id) {
             const child = { parentSessionId: input.session_id, title: `Claude · ${input.agent_type || 'Agent'}`,
@@ -422,6 +462,9 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
       },
       canUseTool: (toolName, toolInput, { signal, suggestions }) => {
         if (session.state.closed) return { behavior: 'deny', message: '会话已中断' };
+        // An autonomous turn may ask permission before emitting an assistant
+        // frame. Establish the Host turn first or its approval card is dropped.
+        beginNativeWakeTurn();
         if (toolName !== 'AskUserQuestion') {
           const currentMode = normalizeClaudePermissionMode(session.permissionMode);
           if (currentMode === 'bypassPermissions' || session.isWorker) {
@@ -466,6 +509,26 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
           }
           continue;
         }
+        if (event.type === 'system' && event.subtype === 'background_tasks_changed') {
+          session.state.backgroundTasks = new Map((event.tasks || []).map(task => [task.task_id, task]));
+          continue;
+        }
+        if (event.type === 'system' && event.subtype === 'task_started') {
+          if (session.state.nativeTurnActive && !event.ambient && !event.skip_transcript) {
+            safeEmit({ kind: 'status', text: `Claude 后台任务已启动：${event.description || event.task_id}` });
+          }
+          continue;
+        }
+        if (event.type === 'system' && event.subtype === 'task_notification') {
+          session.state.pendingWakeSource = 'system';
+          if (session.state.nativeTurnActive && !event.ambient && !event.skip_transcript) {
+            const label = event.status === 'completed' ? '已完成' : event.status === 'failed' ? '失败' : '已停止';
+            safeEmit({ kind: 'status', text: `Claude 后台任务${label}：${event.summary || event.task_id}` });
+          }
+          // A notification is only an edge. Claude owns whether it wakes the
+          // model, so wait for its hook/frame instead of fabricating a turn.
+          continue;
+        }
         if (event.type === "result") {
           const turn = session.state.turn;
           const usage = usageFromResult(event, session.state.latestPlanLimit);
@@ -481,16 +544,29 @@ function spawnSession(sdk, { cwd, resumeId, newSessionId, permissionMode, modelI
           }
           turn?.resolve();
           if (session.state.turn === turn) session.state.turn = null;
+          session.state.nativeTurnActive = false;
           continue;
         }
+        // Only a main-agent assistant frame proves that a model turn exists.
+        // User replay/tool-result frames and subagent assistant frames can arrive
+        // outside the main loop and must not create a phantom Host turn.
+        if (event.type === 'assistant' && event.parent_tool_use_id == null && !session.state.nativeTurnActive) beginNativeWakeTurn();
         if (event.type === 'assistant' && event.uuid) session.state.checkpointId = event.uuid;
         for (const mapped of projectEvent(event)) safeEmit(mapped);
       }
-      // 流正常结束（close）：未结算的回合按取消处理
+      // Unexpected EOF while an autonomous turn is active must settle Host too;
+      // close()/cancel() shut the projection gate first and are already settled
+      // by Runtime, so they intentionally emit nothing here.
+      if (!session.state.closed && session.state.nativeTurnActive) {
+        safeEmit({ kind: 'error', message: 'Claude 原生会话在当前回合完成前结束' });
+      }
+      // 流正常结束（close）：未结算的显式 send Promise 必须释放
       session.state.turn?.resolve();
       session.state.turn = null;
+      session.state.nativeTurnActive = false;
     } catch (error) {
       session.state.crashed = true;
+      session.state.nativeTurnActive = false;
       if (session.state.turn) { session.state.turn.reject(error); session.state.turn = null; }
       else safeEmit({ kind: "error", message: `Claude 会话中断：${error.message}` });
     }
@@ -547,7 +623,7 @@ function create() {
       const isWorker = Boolean(thread.parentThreadId);
       const rawMode = thread.options?.permissionMode;
       const permissionMode = normalizeClaudePermissionMode(rawMode) || (isWorker ? 'bypassPermissions' : undefined);
-      return spawnSession(sdk, {
+      const session = spawnSession(sdk, {
         cwd: thread.cwd,
         resumeId: thread.restore ? thread.nativeSessionId : undefined,
         newSessionId: thread.restore ? undefined : thread.nativeSessionId,
@@ -560,6 +636,11 @@ function create() {
         managedMcp,
         onPlanLimit,
       });
+      if (thread.options?.model?.id === 'fable') {
+        try { await this.setModel(session, thread.options.model); }
+        catch (error) { await this.close(session); throw error; }
+      }
+      return session;
     },
 
     async send(session, text, _hooks, attachments) {
@@ -572,6 +653,7 @@ function create() {
       ];
       await new Promise((resolve, reject) => {
         session.state.turn = { resolve, reject };
+        session.state.nativeTurnActive = true;
         session.input.push({
           type: "user",
           message: { role: "user", content },
@@ -659,13 +741,24 @@ function create() {
       if (!session?.query) return null;
       try {
         const models = await session.query.supportedModels();
-        session.models = models.map((m) => ({ id: m.value, name: m.displayName || m.value, description: m.description, resolved: m.resolvedModel, efforts: m.supportedEffortLevels || [] }));
+        const latest = latestFableModel(models);
+        session.models = models.map((m) => ({ id: m.value,
+          name: m.value === 'fable' && latest ? `Fable ${latest.major}.${latest.minor}（最新版）` : m.displayName || m.value,
+          description: m.description,
+          resolved: m.value === 'fable' && latest ? latest.id : m.resolvedModel,
+          efforts: m.supportedEffortLevels || [] }));
         return session.models;
       } catch { return null; }
     },
     async setModel(session, model) {
-      await session.query?.setModel(model.id);
-      session.model = { id: model.id, name: model.name ?? model.id };
+      let actual = model.id;
+      if (model.id === 'fable') {
+        const models = await this.listModelsFor(session);
+        if (!models) throw new Error('无法确认最新 Fable 模型，请刷新目录后重试');
+        actual = models.find(entry => entry.id === 'fable')?.resolved || model.id;
+      }
+      await session.query?.setModel(actual);
+      session.model = { id: actual, name: model.name ?? actual };
       return session.model;
     },
     async setPermissionMode(session, mode) {
@@ -720,6 +813,7 @@ module.exports = {
   nativeSubagentMessages,
   projectApproval,
   toPermissionResult,
+  latestFableModel,
   resolveCmdShim,
   resolveClaudeExecutable,
 };

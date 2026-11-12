@@ -7,7 +7,7 @@ const { exec, spawn } = require('node:child_process');
 const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const { diff } = require('../workspace/diff');
 const {
   fetchLatestVersion,
@@ -25,6 +25,7 @@ const { nativeEnvironment } = require('./config');
 const { CodexAccountManager } = require('./codex-accounts');
 const { mergeThreadPage } = require('./thread-list');
 const { projectIdForThread, projectIdsForThread } = require('./codex-projects');
+const { AttentionSnapshotService } = require('./attention-snapshot');
 const { workerSessionOptions } = require('../host/collaboration');
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
@@ -282,6 +283,7 @@ class NativeProtocol {
       requestOfficial,
       emit,
     });
+    this.attentionSnapshot = new AttentionSnapshotService(runtime);
     this.approvals = new Map();
     this.pets = require('./pets').createPetMarket();
     this.published = new Map();
@@ -487,7 +489,9 @@ class NativeProtocol {
     // Native runtime names can be resolved aliases, and older Pi records omitted
     // their provider. Prefer the explicitly selected catalog identity, then a
     // unique native match; never guess between providers with the same model id.
-    const matches = actual ? models.filter(model => model.id === actual.id && (!actual.provider || model.provider === actual.provider)) : [];
+    const matches = actual ? models.filter(model =>
+      (model.id === actual.id || model.resolved === actual.id) &&
+      (!actual.provider || model.provider === actual.provider)) : [];
     const selected = exact(configured) || exact(actual) || (matches.length === 1 ? matches[0] : null) || actual || configured;
     // 当前模型适用的思考档位：模型声明了 efforts 以模型为准，否则适用全局目录
     const levelId = entry => (typeof entry === 'string' ? entry : entry?.id);
@@ -542,6 +546,37 @@ class NativeProtocol {
     return raw;
   }
   async request(method, params = {}) {
+    if (method === 'harnessmix/interaction/respond') {
+      if (typeof params.requestId !== 'string' || !params.requestId.startsWith('harness-mix:approval:')) throw new Error('Invalid Harness interaction request');
+      // Acknowledged, idempotent UI replies. A reconnect/manual retry must not
+      // approve the same native request twice; failed native delivery remains retryable.
+      this.panelInteractionResponses ??= new Map();
+      const signature = createHash('sha256').update(JSON.stringify(params.result) ?? 'undefined').digest('hex');
+      const previous = this.panelInteractionResponses.get(params.requestId);
+      if (previous) {
+        if (previous.signature !== signature) throw new Error('Harness interaction already has a different response');
+        return previous.work;
+      }
+      const work = Promise.resolve().then(async () => {
+        if (!await this.respond({ id: params.requestId, result: params.result })) throw new Error('Harness interaction is no longer pending');
+        return { accepted: true };
+      });
+      const entry = { signature, work, settled: false };
+      this.panelInteractionResponses.set(params.requestId, entry);
+      try {
+        const result = await work;
+        entry.settled = true;
+        for (const [id, cached] of this.panelInteractionResponses) {
+          if (this.panelInteractionResponses.size <= 256) break;
+          if (cached.settled) this.panelInteractionResponses.delete(id);
+        }
+        return result;
+      } catch (error) {
+        this.panelInteractionResponses.delete(params.requestId);
+        throw error;
+      }
+    }
+    if (method === 'harnessmix/attention/snapshot') return this.attentionSnapshot.snapshot(params);
     if (method === 'harnessmix/integrations/catalog') return this.runtime.integrations.catalog();
     if (method === 'harnessmix/integrations/list') return this.runtime.integrations.list(params);
     if (method === 'harnessmix/integrations/mcp/save') return this.runtime.integrations.save(params);
@@ -1237,6 +1272,7 @@ class NativeProtocol {
       question: `${source.question || 'Native Harness input'}${source.multiple ? '\n可选择多项；请在“其他”输入中填写多个选项名称。' : ''}`,
       isOther: source.isOther !== false,
       isSecret: source.isSecret === true,
+      ...(source.multiple ? { harnessmixMultiple: true } : {}),
       options: Array.isArray(source.options) ? source.options.map(option => ({
         label: typeof option === 'string' ? option : option.label || option.id,
         description: typeof option === 'string' ? option : option.description || option.label || option.id,

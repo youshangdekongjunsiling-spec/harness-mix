@@ -17,6 +17,7 @@ import {
   type RendererDraftPrewarmPolicyStatus,
 } from "./renderer-draft-prewarm-policy.js";
 import type { LocalSidecar } from "./local-sidecar.js";
+import { installRendererNativeManagerFactory } from "./renderer-native-manager-factory.js";
 
 const SIDECAR_BINDING_NAME = "__harnessmixSidecarSendV1";
 const SIDECAR_PROBE_KEY = "__harnessmixControllerBindingProbeV1";
@@ -49,7 +50,7 @@ export interface RendererCdpControlSnapshot {
 }
 
 interface RendererConnection {
-  command(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  command(method: string, params?: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<unknown>;
   evaluate<T>(expression: string): Promise<T>;
   on?(method: string, listener: (params: unknown) => void): () => void;
   close(): void;
@@ -59,6 +60,7 @@ interface CdpOperations {
   listTargets(endpoint: string): Promise<CdpTarget[]>;
   connect(webSocketDebuggerUrl: string): Promise<RendererConnection>;
   installDraftPrewarmPolicy(renderer: RendererConnection): Promise<RendererDraftPrewarmPolicyStatus>;
+  installNativeManagerFactory?(renderer: RendererConnection): Promise<void>;
 }
 
 export interface RendererCdpControlSession {
@@ -182,7 +184,7 @@ async function evaluateSource(renderer: RendererConnection, source: string): Pro
   const response = await renderer.command("Runtime.evaluate", {
     expression: source,
     awaitPromise: true,
-  });
+  }, { timeoutMs: 60_000 });
   if (!isRecord(response)) {
     throw new Error("Renderer source evaluation returned an invalid result");
   }
@@ -542,6 +544,7 @@ async function installTarget(
       await sidecarRelay.reinstallBinding();
       await sidecarRelay.probe();
       onSidecarRelayReady?.(sidecarRelay);
+      await operations.installNativeManagerFactory?.(renderer);
     }
     await renderer.command("Page.addScriptToEvaluateOnNewDocument", { source: rendererSource });
     await evaluateSource(renderer, rendererSource);
@@ -617,6 +620,7 @@ class ActiveRendererCdpControlSession implements RendererCdpControlSession {
           await this.#sidecarRelay.probe();
           recoverPendingApprovals(this.#renderer);
         }
+        await this.operations.installNativeManagerFactory?.(this.#renderer);
       }
       const existing = await readBinding(this.#renderer);
       if (existing === null) await evaluateSource(this.#renderer, this.rendererSource);
@@ -704,6 +708,7 @@ const liveOperations: CdpOperations = {
   listTargets: (endpoint) => listCdpTargets(endpoint),
   connect: (webSocketDebuggerUrl) => CdpClient.connect(webSocketDebuggerUrl),
   installDraftPrewarmPolicy: installRendererDraftPrewarmPolicyDirect,
+  installNativeManagerFactory: installRendererNativeManagerFactory,
 };
 
 export async function createRendererCdpControlSession(
